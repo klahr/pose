@@ -165,13 +165,15 @@ State lives in `$XDG_DATA_HOME/pose/state.json` (default
 
 **Removing something:** delete its entry and run `pose apply`; pose prunes
 whatever it no longer sees in the config. For a dotfile, delete the entry
-first and the source file after applying. With two exceptions:
+first and the source file after applying. With these exceptions:
 
 - Packages and services that already matched the config when pose first saw
   them are *adopted*: removing them from config only forgets them, never
   uninstalls or stops them.
 - A file that was backed up when a dotfile was linked is moved back when that
   dotfile is pruned.
+- A package whose manager is no longer installed (its check or list exits
+  127) is forgotten with a warning, since there is nothing to uninstall it with.
 
 A failed prune is reported at the end and retried next run without blocking
 the rest of the apply.

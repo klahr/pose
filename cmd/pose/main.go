@@ -178,9 +178,13 @@ type hostFlag struct{ opts *options }
 func (f hostFlag) String() string   { return "" }
 func (f hostFlag) IsBoolFlag() bool { return true }
 func (f hostFlag) Set(v string) error {
-	f.opts.editHost = true
-	if v != "true" {
-		f.opts.host = v
+	switch v {
+	case "true":
+		f.opts.editHost = true
+	case "false":
+		f.opts.editHost, f.opts.host = false, ""
+	default:
+		f.opts.editHost, f.opts.host = true, v
 	}
 	return nil
 }
@@ -240,12 +244,12 @@ func load(ui *engine.UI, opts options, lock bool) (*engine.Engine, *state.Store,
 		return nil, nil, err
 	}
 
-	home, _ := os.UserHomeDir()
 	ui.Info("Loading config from %s (host: %s)", dir, host)
 	cfg, err := config.Load(dir, host)
 	if err != nil {
 		return nil, nil, err
 	}
+	home := cfg.Home
 	// A mistyped --host would otherwise silently drop the host's overlay, and
 	// apply would prune everything it declares.
 	if opts.host != "" && cfg.HostFile == "" {
@@ -319,7 +323,7 @@ func cmdApply(ctx context.Context, ui *engine.UI, opts options) (int, error) {
 	}
 
 	if p.HasChanges() && !opts.yes {
-		ok, err := confirm(ui)
+		ok, err := confirm(ctx, ui)
 		if err != nil {
 			return 0, err
 		}
@@ -338,16 +342,29 @@ func cmdApply(ctx context.Context, ui *engine.UI, opts options) (int, error) {
 	return 0, nil
 }
 
-func confirm(ui *engine.UI) (bool, error) {
+func confirm(ctx context.Context, ui *engine.UI) (bool, error) {
 	if !engine.IsTerminal(os.Stdin) {
 		return false, errors.New("refusing to apply without confirmation: stdin is not a terminal (use --yes)")
 	}
 	ui.Printf("\nDo you want to perform these actions?\n  Only 'yes' will be accepted: ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
+	type answer struct {
+		line string
+		err  error
 	}
-	return strings.TrimSpace(line) == "yes", nil
+	ch := make(chan answer, 1)
+	go func() {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		ch <- answer{line, err}
+	}()
+	select {
+	case <-ctx.Done(): // Ctrl-C at the prompt
+		return false, nil
+	case a := <-ch:
+		if a.err != nil && !errors.Is(a.err, io.EOF) {
+			return false, a.err
+		}
+		return strings.TrimSpace(a.line) == "yes", nil
+	}
 }
 
 func cmdStateList(ui *engine.UI, opts options) error {

@@ -81,6 +81,8 @@ func Load(root, hostname string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("determine home directory: %w", err)
 	}
+	// A trailing slash would change every state key derived from ContractHome.
+	home = filepath.Clean(home)
 	if root, err = ExpandHome(root, home); err != nil {
 		return nil, err
 	}
@@ -135,6 +137,9 @@ func parseFile(path, root, home string) (*Config, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if err := dec.Decode(new(yaml.Node)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("parse %s: only one YAML document is supported", path)
 	}
 	if err := c.resolve(root, home); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -243,6 +248,10 @@ func (c *Config) validate() error {
 			within(realTarget, realRoot) || within(realRoot, realTarget) {
 			errs = append(errs, fmt.Errorf("dotfile %s: target must not overlap the repository %s", d.Target, c.Root))
 		}
+		// Linking would move the source aside and point the target at itself.
+		if within(d.SourcePath, d.TargetPath) || within(resolveExisting(d.SourcePath), realTarget) {
+			errs = append(errs, fmt.Errorf("dotfile %s: source %s must not be the target or lie inside it", d.Target, d.Source))
+		}
 		for _, o := range c.Dotfiles[:i] {
 			if within(d.TargetPath, o.TargetPath) || within(o.TargetPath, d.TargetPath) {
 				errs = append(errs, fmt.Errorf("dotfile %s: target is nested with %s; links would be created through each other", d.Target, o.Target))
@@ -250,7 +259,14 @@ func (c *Config) validate() error {
 		}
 	}
 
+	units := map[string]string{}
 	for _, s := range c.Services {
+		// systemd treats "foo" and "foo.service" as the same unit.
+		unit := s.Scope + ":" + strings.TrimSuffix(s.Name, ".service")
+		if other, ok := units[unit]; ok {
+			errs = append(errs, fmt.Errorf("service %s: same unit as %s; use one name", s.Name, other))
+		}
+		units[unit] = s.Name
 		if !serviceRe.MatchString(s.Name) {
 			errs = append(errs, fmt.Errorf("service %q: invalid name", s.Name))
 		}

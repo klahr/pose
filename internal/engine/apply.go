@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -204,8 +205,11 @@ func (e *Engine) linkDotfiles(_ context.Context, p *Plan) error {
 		if err != nil {
 			return err
 		}
-		if backup != "" {
-			a.Backup = backup // on the action, so runHooks records it too
+		// Keep the first backup while it exists: it holds the file from before pose,
+		// later ones what an app wrote over the link. On the action, so runHooks
+		// records it too.
+		if _, err := os.Lstat(a.Backup); backup != "" && (a.Backup == "" || err != nil) {
+			a.Backup = backup
 		}
 		r := a.resource()
 		if a.Hook {

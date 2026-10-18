@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -130,6 +131,17 @@ func TestListIsCachedUntilMutation(t *testing.T) {
 	}
 	if ok, _ := pm.IsInstalled(ctx, "c"); !ok {
 		t.Error("cache not invalidated by install")
+	}
+}
+
+func TestSystemdWithoutUserBusIsAnError(t *testing.T) {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Skip("systemctl not installed")
+	}
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+	t.Setenv("XDG_RUNTIME_DIR", "/nonexistent")
+	if st, err := (systemd{}).Status(context.Background(), "pose-test.service", config.ScopeUser); err == nil {
+		t.Errorf("unreachable user bus reported as %+v", st)
 	}
 }
 

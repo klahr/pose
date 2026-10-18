@@ -69,7 +69,9 @@ func (systemd) exec(ctx context.Context, scope string, mutate bool, args ...stri
 
 func (s systemd) Status(ctx context.Context, name, scope string) (ServiceStatus, error) {
 	res, err := s.exec(ctx, scope, false, "is-active", name)
-	if err != nil && !exitedNonZero(err) {
+	// is-active prints a state even for unknown units; no output means systemctl
+	// could not ask at all, e.g. without a user session bus over ssh or su.
+	if err != nil && (!exitedNonZero(err) || strings.TrimSpace(res.stdout) == "") {
 		return ServiceStatus{}, err
 	}
 	st := ServiceStatus{Exists: true, Active: strings.TrimSpace(res.stdout) == "active"}

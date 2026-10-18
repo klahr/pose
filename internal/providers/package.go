@@ -53,6 +53,13 @@ func exitedNonZero(err error) bool {
 	return errors.As(err, &ce) && ce.ExitCode > 0 && ce.ExitCode != 126 && ce.ExitCode != 127
 }
 
+// ManagerMissing reports whether err is a check or list command that could not
+// find its package manager (exit status 126 or 127).
+func ManagerMissing(err error) bool {
+	var ce *CommandError
+	return errors.As(err, &ce) && (ce.ExitCode == 126 || ce.ExitCode == 127)
+}
+
 type result struct {
 	stdout, stderr string
 }

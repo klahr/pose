@@ -182,6 +182,14 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 	parallel(len(items), 8, func(i int) {
 		installed[i], errs[i] = e.packages[items[i].mgr].IsInstalled(ctx, items[i].pkg)
 	})
+	// A package only left to prune must not block every run once its manager is
+	// gone; there is nothing left to uninstall it with.
+	missing := make([]bool, len(items))
+	for i, err := range errs {
+		if err != nil && !items[i].desired && providers.ManagerMissing(err) {
+			missing[i], errs[i] = true, nil
+		}
+	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
@@ -196,6 +204,10 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 			a.Kind, a.Adopted = Adopt, true
 		case it.desired:
 			continue
+		case missing[i]:
+			a.Kind = Forget
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"package %q (%s) is no longer in config, but package manager %q is not available; forgetting it without uninstalling", it.pkg, it.mgr, it.mgr))
 		case installed[i] && it.adopted:
 			a.Kind = Forget
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
@@ -213,10 +225,12 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 
 func (e *Engine) planDotfiles(_ context.Context, p *Plan) error {
 	desired := map[string]bool{}
+	desiredTargets := map[string]bool{}
 	for _, d := range e.cfg.Dotfiles {
 		target := config.ContractHome(d.TargetPath, e.cfg.Home)
 		key := state.DotfileKey(target)
 		desired[key] = true
+		desiredTargets[d.TargetPath] = true
 
 		// The hash only decides whether on_change must run; content edits are
 		// otherwise live already, since the target is a symlink.
@@ -288,14 +302,18 @@ func (e *Engine) planDotfiles(_ context.Context, p *Plan) error {
 			Target: config.ContractHome(r.Target, e.cfg.Home), Source: e.displaySource(r.Source),
 			TargetPath: r.Target, SourcePath: r.Source, Backup: r.Backup,
 		}
-		switch st.Status {
-		case providers.LinkCorrect:
+		switch {
+		case desiredTargets[r.Target]:
+			// Tracked under another key (e.g. $HOME was spelled differently); the
+			// desired entry owns the target now, so it must not be unlinked.
+			a.Kind = Forget
+		case st.Status == providers.LinkCorrect:
 			a.Kind = Prune
 			a.Notes = []string{"symlink will be removed, missing from config"}
 			if r.Backup != "" {
 				a.Notes = append(a.Notes, fmt.Sprintf("backup %s will be restored if still present", config.ContractHome(r.Backup, e.cfg.Home)))
 			}
-		case providers.LinkMissing:
+		case st.Status == providers.LinkMissing:
 			a.Kind = Forget
 		default:
 			a.Kind = Forget

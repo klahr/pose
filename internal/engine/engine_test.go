@@ -208,6 +208,44 @@ func TestPruneFailureDoesNotBlockInstalls(t *testing.T) {
 	}
 }
 
+func TestMissingManagerDoesNotBlockPrune(t *testing.T) {
+	h := newHarness(t)
+	h.config("packages:\n  fake: [a]\n")
+	h.mustApply()
+
+	h.write("pose.yaml", `providers:
+  package_managers:
+    fake:
+      check: "pose-no-such-command {package}"
+      install: "pose-no-such-command {packages}"
+      remove: "pose-no-such-command {packages}"
+`)
+	p := h.mustApply()
+	if k := kinds(p)["package:fake:a"]; k != Forget || len(p.Warnings) != 1 {
+		t.Fatalf("kind = %v, warnings = %q", k, p.Warnings)
+	}
+	if _, ok := h.stateResource("package:fake:a"); ok {
+		t.Error("package still tracked")
+	}
+
+	// A desired package still needs a working manager.
+	h.write("pose.yaml", `providers:
+  package_managers:
+    fake:
+      check: "pose-no-such-command {package}"
+      install: "pose-no-such-command {packages}"
+      remove: "pose-no-such-command {packages}"
+packages:
+  fake: [a]
+`)
+	cfg, _ := config.Load(h.root, "host")
+	store, _ := state.Open(h.state, false)
+	e, _ := New(cfg, store, NewUI(os.Stderr, os.Stderr))
+	if _, err := e.Plan(context.Background()); err == nil {
+		t.Error("desired package with a missing manager did not fail the plan")
+	}
+}
+
 func TestDotfileEditWithoutHookIsNoChange(t *testing.T) {
 	h := newHarness(t)
 	h.write("files/a", "1")
@@ -252,6 +290,55 @@ func TestBackupRestoredOnPrune(t *testing.T) {
 	if r, _ := h.stateResource("dotfile:~/.a"); r.Backup == "" {
 		t.Fatal("backup not recorded in state (or lost when the hook ran)")
 	}
+
+	h.config("")
+	h.mustApply()
+	if b, err := os.ReadFile(target); err != nil || string(b) != "mine" {
+		t.Errorf("target after prune = %q, %v", b, err)
+	}
+}
+
+func TestHomeSpellingDoesNotUnlinkDeclaredDotfile(t *testing.T) {
+	h := newHarness(t)
+	target := filepath.Join(h.home, ".a")
+	h.write("files/a", "a")
+	h.config("dotfiles:\n  - {source: ./files/a, target: ~/.a}\n")
+	h.mustApply()
+
+	t.Setenv("HOME", h.home+"/")
+	if p := h.mustApply(); p.HasChanges() {
+		t.Errorf("trailing slash on HOME planned changes: %v", kinds(p))
+	}
+
+	// State written under an absolute key by an older version.
+	s, err := state.Open(h.state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := s.State.Resources["dotfile:~/.a"]
+	s.Delete("dotfile:~/.a")
+	s.Put("dotfile:"+target, r)
+	s.Close()
+	if p := h.mustApply(); p.HasChanges() {
+		t.Errorf("old key planned changes: %v", kinds(p))
+	}
+	if _, err := os.Lstat(target); err != nil {
+		t.Errorf("declared dotfile was unlinked: %v", err)
+	}
+}
+
+func TestOriginalBackupSurvivesAppOverwrite(t *testing.T) {
+	h := newHarness(t)
+	target := filepath.Join(h.home, ".a")
+	h.write(target, "mine")
+	h.write("files/a", "repo")
+	h.config("dotfiles:\n  - {source: ./files/a, target: ~/.a}\n")
+	h.mustApply()
+
+	// An app saves by writing a new file over the link.
+	os.Remove(target)
+	h.write(target, "app")
+	h.mustApply()
 
 	h.config("")
 	h.mustApply()

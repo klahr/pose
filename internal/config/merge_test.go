@@ -124,6 +124,45 @@ dotfiles:
 	}
 }
 
+func TestSourceInsideTargetRejected(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(home, ".config", "nvim"), 0o755)
+	os.WriteFile(filepath.Join(home, ".bashrc"), nil, 0o644)
+	os.WriteFile(filepath.Join(home, ".config", "nvim", "init.lua"), nil, 0o644)
+
+	for _, d := range []string{
+		"{source: ~/.bashrc, target: ~/.bashrc}",
+		"{source: ~/.config/nvim/init.lua, target: ~/.config/nvim}",
+	} {
+		os.WriteFile(filepath.Join(root, "pose.yaml"), []byte("dotfiles:\n  - "+d+"\n"), 0o644)
+		if _, err := Load(root, "h"); err == nil || !strings.Contains(err.Error(), "must not be the target") {
+			t.Errorf("%s: err = %v", d, err)
+		}
+	}
+}
+
+func TestLoadRejects(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	for _, tc := range []struct{ yaml, want string }{
+		{"packages:\n  pacman: [git]\n---\npackages:\n  pacman: [vim]\n", "only one YAML document"},
+		{"services:\n  - {name: foo}\n  - {name: foo.service, state: stopped}\n", "same unit as foo"},
+	} {
+		os.WriteFile(filepath.Join(root, "pose.yaml"), []byte(tc.yaml), 0o644)
+		if _, err := Load(root, "h"); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%q: err = %v", tc.yaml, err)
+		}
+	}
+	for _, ok := range []string{"", "# empty\n", "---\npackages:\n  pacman: [git]\n"} {
+		os.WriteFile(filepath.Join(root, "pose.yaml"), []byte(ok), 0o644)
+		if _, err := Load(root, "h"); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+}
+
 func TestBuiltinTemplatesAreValidShell(t *testing.T) {
 	for name, pm := range BuiltinPackageManagers() {
 		for field, tmpl := range map[string]string{"check": pm.Check, "list": pm.List, "install": pm.Install, "remove": pm.Remove} {
