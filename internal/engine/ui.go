@@ -24,10 +24,9 @@ type UI struct {
 	color bool
 }
 
-// NewUI writes to f, using color when f is a terminal, NO_COLOR is unset and
-// noColor is false.
-func NewUI(f *os.File, noColor bool) *UI {
-	color := !noColor && IsTerminal(f) && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
+// NewUI writes to f, using color when f is a terminal and NO_COLOR is unset.
+func NewUI(f *os.File) *UI {
+	color := IsTerminal(f) && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 	return &UI{out: f, color: color}
 }
 

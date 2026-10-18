@@ -33,15 +33,16 @@ Flags:
   -C, --dir DIR        configuration repository (default $POSE_DIR or ~/.dotfiles)
       --host NAME      host overlay to use (default: short hostname)
       --state FILE     state file (default $XDG_DATA_HOME/pose/state.json)
-      --no-color       disable colored output
   -y, --yes            apply: skip the confirmation prompt
       --detailed-exitcode
                        plan: exit 2 when there are changes, 0 when there are none
+
+Environment:
+  NO_COLOR             disable colored output when set to a non-empty value
 `
 
 type options struct {
 	dir, host, statePath string
-	noColor              bool
 	yes                  bool
 	detailedExitCode     bool
 }
@@ -84,7 +85,6 @@ func run(args []string) int {
 	fs.StringVar(&opts.dir, "dir", "", "")
 	fs.StringVar(&opts.host, "host", "", "")
 	fs.StringVar(&opts.statePath, "state", "", "")
-	fs.BoolVar(&opts.noColor, "no-color", false, "")
 	if cmd == "apply" {
 		fs.BoolVar(&opts.yes, "y", false, "")
 		fs.BoolVar(&opts.yes, "yes", false, "")
@@ -105,7 +105,7 @@ func run(args []string) int {
 		return 2
 	}
 
-	ui := engine.NewUI(os.Stdout, opts.noColor)
+	ui := engine.NewUI(os.Stdout)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
