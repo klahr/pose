@@ -45,6 +45,11 @@ func NormalizeHostname(h string) string {
 	return h
 }
 
+// ValidHostname reports whether h can name a host overlay file.
+func ValidHostname(h string) bool {
+	return hostnameRe.MatchString(h)
+}
+
 // ExpandHome expands a leading "~" or "~/" to home. "~user" is not supported.
 func ExpandHome(p, home string) (string, error) {
 	switch {

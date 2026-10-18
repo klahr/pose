@@ -15,6 +15,7 @@ make install          # installs to ~/.local/bin (override with PREFIX=...)
 pose plan             # show what would change
 pose apply            # apply changes (prompts; -y to skip)
 pose state list       # list managed resources
+pose edit             # open pose.yaml in $VISUAL/$EDITOR (--host: this host's overlay)
 ```
 
 Config is read from `~/.dotfiles` (or `$POSE_DIR`, or `-C DIR`):

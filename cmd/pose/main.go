@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,8 @@ Usage:
   pose plan  [flags]        show what apply would change
   pose apply [flags]        converge the system (prompts unless --yes)
   pose state list [flags]   list resources tracked in the state file
+  pose edit [--host [NAME]] open pose.yaml, or with --host the host overlay
+                            (default: this host's), in $VISUAL or $EDITOR
   pose version
 
 Flags (-C, --dir, --host, --state and --force-host may also precede the command):
@@ -50,6 +54,7 @@ type options struct {
 	forceHost            bool
 	yes                  bool
 	detailedExitCode     bool
+	editHost             bool
 }
 
 func main() {
@@ -85,7 +90,7 @@ func run(args []string) int {
 	case "version", "--version":
 		fmt.Println("pose", version)
 		return 0
-	case "plan", "apply", "state list":
+	case "plan", "apply", "state list", "edit":
 	default:
 		fmt.Fprintf(os.Stderr, "pose: unknown command %q\n\n%s", cmd, usage)
 		return 2
@@ -95,8 +100,13 @@ func run(args []string) int {
 	if code, ok := parseFlags(fs, "pose "+cmd, args); !ok {
 		return code
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "pose %s: unexpected argument %q\n", cmd, fs.Arg(0))
+	rest := fs.Args()
+	// "edit --host NAME": the bare --host parses as a boolean, so NAME is left over.
+	if cmd == "edit" && opts.editHost && opts.host == "" && len(rest) == 1 {
+		opts.host, rest = rest[0], nil
+	}
+	if len(rest) > 0 {
+		fmt.Fprintf(os.Stderr, "pose %s: unexpected argument %q\n", cmd, rest[0])
 		return 2
 	}
 
@@ -118,6 +128,8 @@ func run(args []string) int {
 		code, err = cmdApply(ctx, ui, opts)
 	case "state list":
 		err = cmdStateList(ui, opts)
+	case "edit":
+		err = cmdEdit(ui, opts)
 	}
 	if err != nil {
 		ui.Error("%v", err)
@@ -142,7 +154,11 @@ func newFlagSet(cmd string, opts *options) *flag.FlagSet {
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&opts.dir, "C", opts.dir, "")
 	fs.StringVar(&opts.dir, "dir", opts.dir, "")
-	fs.StringVar(&opts.host, "host", opts.host, "")
+	if cmd == "edit" {
+		fs.Var(hostFlag{opts}, "host", "")
+	} else {
+		fs.StringVar(&opts.host, "host", opts.host, "")
+	}
 	fs.StringVar(&opts.statePath, "state", opts.statePath, "")
 	fs.BoolVar(&opts.forceHost, "force-host", opts.forceHost, "")
 	switch cmd {
@@ -153,6 +169,20 @@ func newFlagSet(cmd string, opts *options) *flag.FlagSet {
 		fs.BoolVar(&opts.detailedExitCode, "detailed-exitcode", false, "")
 	}
 	return fs
+}
+
+// hostFlag is edit's --host: alone it selects this host's overlay, with a
+// value (--host=NAME, or NAME as the next argument) it names the host.
+type hostFlag struct{ opts *options }
+
+func (f hostFlag) String() string   { return "" }
+func (f hostFlag) IsBoolFlag() bool { return true }
+func (f hostFlag) Set(v string) error {
+	f.opts.editHost = true
+	if v != "true" {
+		f.opts.host = v
+	}
+	return nil
 }
 
 // parseFlags parses args into fs. When it returns false, the caller exits with code.
@@ -176,25 +206,38 @@ func statePath(opts options) (string, error) {
 	return state.DefaultPath()
 }
 
+func configDir(opts options) string {
+	if opts.dir != "" {
+		return opts.dir
+	}
+	if dir := os.Getenv("POSE_DIR"); dir != "" {
+		return dir
+	}
+	return "~/.dotfiles"
+}
+
+func hostName(opts options) (string, error) {
+	if opts.host == "" {
+		return config.ShortHostname()
+	}
+	// A name that normalizes to nothing ("../x" is cut at its first dot) must not
+	// fall back to this host's overlay.
+	if host := config.NormalizeHostname(opts.host); host != "" {
+		return host, nil
+	}
+	return "", fmt.Errorf("invalid hostname %q", opts.host)
+}
+
 // load reads config and state and prepares an engine.
 func load(ui *engine.UI, opts options, lock bool) (*engine.Engine, *state.Store, error) {
 	if os.Geteuid() == 0 {
 		return nil, nil, errors.New("pose must not run as root; it calls sudo itself where needed")
 	}
 
-	dir := opts.dir
-	if dir == "" {
-		dir = os.Getenv("POSE_DIR")
-	}
-	if dir == "" {
-		dir = "~/.dotfiles"
-	}
-	host := config.NormalizeHostname(opts.host)
-	if host == "" {
-		var err error
-		if host, err = config.ShortHostname(); err != nil {
-			return nil, nil, err
-		}
+	dir := configDir(opts)
+	host, err := hostName(opts)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	home, _ := os.UserHomeDir()
@@ -323,6 +366,61 @@ func cmdStateList(ui *engine.UI, opts options) error {
 	}
 	for _, k := range keys {
 		ui.Printf("%s\n", k)
+	}
+	return nil
+}
+
+// cmdEdit opens pose.yaml, or a host overlay, in the user's editor. Either file
+// may be new, but the repository itself must exist.
+func cmdEdit(ui *engine.UI, opts options) error {
+	if os.Geteuid() == 0 {
+		return errors.New("pose must not run as root; it calls sudo itself where needed")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("determine home directory: %w", err)
+	}
+	root, err := config.ExpandHome(configDir(opts), home)
+	if err != nil {
+		return err
+	}
+	if root, err = filepath.Abs(root); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) || err == nil && !fi.IsDir() {
+		return fmt.Errorf("configuration repository %s does not exist", config.ContractHome(root, home))
+	} else if err != nil {
+		return err
+	}
+
+	path := filepath.Join(root, config.BaseFile)
+	if opts.editHost || opts.host != "" {
+		host, err := hostName(opts)
+		if err != nil {
+			return err
+		}
+		if !config.ValidHostname(host) {
+			return fmt.Errorf("invalid hostname %q", host)
+		}
+		path = filepath.Join(root, config.HostsDir, host+".yaml")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+	}
+
+	editor := os.Getenv("VISUAL")
+	if editor == "" {
+		editor = os.Getenv("EDITOR")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	ui.Info("Editing %s", config.ContractHome(path, home))
+	// Through sh, so editors given with arguments ("code --wait") work.
+	cmd := exec.Command("sh", "-c", editor+` "$1"`, "sh", path)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("editor %q: %w", editor, err)
 	}
 	return nil
 }
