@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -97,6 +98,17 @@ func (u *UI) describe(a *Action) string {
 	default:
 		return fmt.Sprintf("service %q (%s)", a.Name, a.Scope)
 	}
+}
+
+// Headline is an action's plan line without color, notes appended.
+func (u *UI) Headline(a *Action) string {
+	plain := *u
+	plain.color = false
+	line := plain.symbol(a.Kind) + " " + plain.describe(a)
+	if len(a.Notes) > 0 {
+		line += "  · " + strings.Join(a.Notes, " · ")
+	}
+	return line
 }
 
 // Step announces an action being executed.

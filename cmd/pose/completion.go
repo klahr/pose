@@ -34,7 +34,7 @@ _pose() {
 	case $cmd in
 	'') COMPREPLY=($(compgen -W "plan apply state edit add package completion version help $flags" -- "$cur")) ;;
 	plan) COMPREPLY=($(compgen -W "--detailed-exitcode --target $flags" -- "$cur")) ;;
-	apply) COMPREPLY=($(compgen -W "-y --yes --target $flags" -- "$cur")) ;;
+	apply) COMPREPLY=($(compgen -W "-y --yes -i --interactive --target $flags" -- "$cur")) ;;
 	edit) COMPREPLY=($(compgen -W "$flags" -- "$cur")) ;;
 	add) if [[ $cur == -* ]]; then COMPREPLY=($(compgen -W "$flags" -- "$cur")); else _filedir; fi ;;
 	state)
@@ -49,7 +49,8 @@ _pose() {
 	package)
 		case $sub in
 		'') COMPREPLY=($(compgen -W "add unmanaged" -- "$cur")) ;;
-		*) COMPREPLY=($(compgen -W "-m --manager $flags" -- "$cur")) ;;
+		add) COMPREPLY=($(compgen -W "-m --manager $flags" -- "$cur")) ;;
+		*) COMPREPLY=($(compgen -W "-m --manager -i --interactive $flags" -- "$cur")) ;;
 		esac
 		;;
 	completion) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
@@ -79,11 +80,11 @@ _pose() {
 	case $cmd in
 	'') _arguments $global '*::command:(plan apply state edit add package completion version help)' ;;
 	plan) _arguments $global '--detailed-exitcode[exit 2 when there are changes]' '*--target[only act on KEY]:key:(package dotfile service script $keys)' ;;
-	apply) _arguments $global '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]' '*--target[only act on KEY]:key:(package dotfile service script $keys)' ;;
+	apply) _arguments $global '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]' '(-i --interactive)'{-i,--interactive}'[pick actions from a list]' '*--target[only act on KEY]:key:(package dotfile service script $keys)' ;;
 	edit) _arguments $global ;;
 	add) _arguments $global '1:path:_files' ;;
 	state) _arguments $global '1:subcommand:(list rm)' '*:key:(${keys})' ;;
-	package) _arguments $global '(-m --manager)'{-m,--manager}'[package manager]:manager:' '1:subcommand:(add unmanaged)' '*:package:' ;;
+	package) _arguments $global '(-m --manager)'{-m,--manager}'[package manager]:manager:' '(-i --interactive)'{-i,--interactive}'[pick packages from a list]' '1:subcommand:(add unmanaged)' '*:package:' ;;
 	completion) _arguments '1:shell:(bash zsh fish)' ;;
 	esac
 }
@@ -101,6 +102,7 @@ complete -c pose -l force-host -d "accept a state file written for another host"
 complete -c pose -n "__fish_seen_subcommand_from plan" -l detailed-exitcode -d "exit 2 when there are changes"
 complete -c pose -n "__fish_seen_subcommand_from plan apply" -l target -x -a "package dotfile service script (pose state list 2>/dev/null)" -d "only act on KEY"
 complete -c pose -n "__fish_seen_subcommand_from apply" -s y -l yes -d "skip the confirmation prompt"
+complete -c pose -n "__fish_seen_subcommand_from apply unmanaged" -s i -l interactive -d "pick from a list"
 complete -c pose -n "__fish_seen_subcommand_from add" -F
 complete -c pose -n "__fish_seen_subcommand_from state; and not __fish_seen_subcommand_from list rm" -a "list rm"
 complete -c pose -n "__fish_seen_subcommand_from rm" -a "(pose state list 2>/dev/null)"

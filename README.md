@@ -75,6 +75,7 @@ packages you installed on request that the config does not declare yet, one
 per line on stdout:
 
 ```sh
+pose package unmanaged -i          # pick from a list; the picks are added to pose.yaml
 pose package unmanaged -m pacman | xargs pose package add -m pacman
 ```
 
@@ -255,7 +256,7 @@ change is real. `--host NAME` also requires `hosts/NAME.yaml` to exist.
 
 ```sh
 pose plan             # show what would change (--detailed-exitcode: exit 2 on changes)
-pose apply            # apply changes (prompts; -y to skip)
+pose apply            # apply changes (prompts; -y to skip, -i to pick actions from a list)
 pose state list       # list managed resources
 pose state rm KEY...  # stop tracking resources without touching them
 pose edit             # open pose.yaml in $VISUAL/$EDITOR (--host [NAME]: a host overlay)

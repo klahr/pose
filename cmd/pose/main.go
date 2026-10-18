@@ -20,6 +20,7 @@ import (
 
 	"github.com/klahr/pose/internal/config"
 	"github.com/klahr/pose/internal/engine"
+	"github.com/klahr/pose/internal/picker"
 	"github.com/klahr/pose/internal/providers"
 	"github.com/klahr/pose/internal/state"
 )
@@ -59,6 +60,9 @@ Flags (-C, --dir, --host, --state and --force-host may also precede the command)
       --target KEY     plan, apply: only act on KEY or what lies below it, e.g.
                        package, package:pacman, dotfile:~/.config/nvim,
                        service:user:syncthing; repeatable
+  -i, --interactive    apply: pick the actions to apply from a list (instead of
+                       the confirmation prompt); package unmanaged: pick the
+                       packages to add to pose.yaml
   -y, --yes            apply: skip the confirmation prompt
       --detailed-exitcode
                        plan: exit 2 when there are changes, 0 when there are none
@@ -75,6 +79,7 @@ type options struct {
 	editHost             bool
 	targets              []string
 	manager              string
+	interactive          bool
 }
 
 func main() {
@@ -213,6 +218,8 @@ func newFlagSet(cmd string, opts *options) *flag.FlagSet {
 	case "apply":
 		fs.BoolVar(&opts.yes, "y", false, "")
 		fs.BoolVar(&opts.yes, "yes", false, "")
+		fs.BoolVar(&opts.interactive, "i", false, "")
+		fs.BoolVar(&opts.interactive, "interactive", false, "")
 		fs.Var(targetFlag{opts}, "target", "")
 	case "plan":
 		fs.BoolVar(&opts.detailedExitCode, "detailed-exitcode", false, "")
@@ -220,6 +227,10 @@ func newFlagSet(cmd string, opts *options) *flag.FlagSet {
 	case "package add", "package unmanaged":
 		fs.StringVar(&opts.manager, "m", "", "")
 		fs.StringVar(&opts.manager, "manager", "", "")
+		if cmd == "package unmanaged" {
+			fs.BoolVar(&opts.interactive, "i", false, "")
+			fs.BoolVar(&opts.interactive, "interactive", false, "")
+		}
 	}
 	return fs
 }
@@ -414,6 +425,16 @@ func cmdApply(ctx context.Context, ui *engine.UI, opts options) (int, error) {
 			return 0, err
 		}
 	}
+	if opts.interactive && p.HasChanges() {
+		ok, err := pickActions(ui, p)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			ui.Printf("Apply cancelled.\n")
+			return 1, nil
+		}
+	}
 	ui.RenderPlan(p)
 	if p.Empty() {
 		// Record the new hostname, or every later run fails the host check again.
@@ -423,7 +444,7 @@ func cmdApply(ctx context.Context, ui *engine.UI, opts options) (int, error) {
 		return 0, nil
 	}
 
-	if p.HasChanges() && !opts.yes {
+	if p.HasChanges() && !opts.yes && !opts.interactive {
 		ok, err := confirm(ctx, ui)
 		if err != nil {
 			return 0, err
@@ -441,6 +462,28 @@ func cmdApply(ctx context.Context, ui *engine.UI, opts options) (int, error) {
 	ui.Printf("\nApply complete! %d installed, %d linked, %d updated, %d pruned, %d run.\n",
 		p.Count(engine.Install), p.Count(engine.Link), p.Count(engine.Update), p.Count(engine.Prune), p.Count(engine.Run))
 	return 0, nil
+}
+
+// pickActions lets the user deselect changes; bookkeeping actions always stay.
+func pickActions(ui *engine.UI, p *engine.Plan) (bool, error) {
+	var changes []*engine.Action
+	var items []picker.Item
+	for _, a := range p.Actions {
+		if a.Kind.Changes() {
+			changes = append(changes, a)
+			items = append(items, picker.Item{Label: ui.Headline(a), Selected: true})
+		}
+	}
+	ok, err := picker.Run(os.Stdin, os.Stderr, "Select the actions to apply", "apply", items)
+	if err != nil || !ok {
+		return false, err
+	}
+	drop := map[*engine.Action]bool{}
+	for i, it := range items {
+		drop[changes[i]] = !it.Selected
+	}
+	p.Actions = slices.DeleteFunc(p.Actions, func(a *engine.Action) bool { return drop[a] })
+	return true, nil
 }
 
 func confirm(ctx context.Context, ui *engine.UI) (bool, error) {
@@ -685,6 +728,12 @@ func cmdPackageAdd(ui *engine.UI, opts options, pkgs []string) error {
 		mgr = used[0]
 	}
 
+	return declarePackages(ui, path, root, home, host, mgr, pkgs)
+}
+
+// declarePackages adds pkgs to packages.<mgr> in path, undoing the edit if the
+// config for host no longer loads.
+func declarePackages(ui *engine.UI, path, root, home, host, mgr string, pkgs []string) error {
 	added, undo, err := config.AddPackages(path, mgr, pkgs)
 	if err != nil {
 		return err
@@ -726,6 +775,8 @@ func cmdPackageUnmanaged(ctx context.Context, ui *engine.UI, opts options) error
 			declared[p], declared[name] = true, true
 		}
 	}
+	type candidate struct{ mgr, pkg string }
+	var found []candidate
 	for _, name := range managers {
 		pkgs, ok, err := providers.NewPackageManager(name, cfg.Providers.PackageManagers[name]).Explicit(ctx)
 		switch {
@@ -739,7 +790,42 @@ func cmdPackageUnmanaged(ctx context.Context, ui *engine.UI, opts options) error
 		pkgs = slices.DeleteFunc(pkgs, func(p string) bool { return declared[p] })
 		ui.Info("%s: %d not in config", name, len(pkgs))
 		for _, p := range pkgs {
-			fmt.Println(p)
+			if opts.interactive {
+				found = append(found, candidate{name, p})
+			} else {
+				fmt.Println(p)
+			}
+		}
+	}
+	if !opts.interactive || len(found) == 0 {
+		return nil
+	}
+
+	items := make([]picker.Item, len(found))
+	for i, c := range found {
+		items[i].Label = c.pkg
+		if len(managers) > 1 {
+			items[i].Label += "  (" + c.mgr + ")"
+		}
+	}
+	ok, err := picker.Run(os.Stdin, os.Stderr, "Select packages to add to "+config.BaseFile, "add", items)
+	if err != nil || !ok {
+		return err
+	}
+	byManager := map[string][]string{}
+	for i, it := range items {
+		if it.Selected {
+			byManager[found[i].mgr] = append(byManager[found[i].mgr], found[i].pkg)
+		}
+	}
+	if len(byManager) == 0 {
+		ui.Info("Nothing selected")
+		return nil
+	}
+	path := filepath.Join(cfg.Root, config.BaseFile)
+	for _, mgr := range sortedKeys(byManager) {
+		if err := declarePackages(ui, path, cfg.Root, cfg.Home, cfg.Hostname, mgr, byManager[mgr]); err != nil {
+			return err
 		}
 	}
 	return nil
