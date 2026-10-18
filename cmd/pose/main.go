@@ -329,6 +329,10 @@ func cmdApply(ctx context.Context, ui *engine.UI, opts options) (int, error) {
 	}
 	ui.RenderPlan(p)
 	if p.Empty() {
+		// Record the new hostname, or every later run fails the host check again.
+		if opts.forceHost {
+			return 0, store.Save()
+		}
 		return 0, nil
 	}
 

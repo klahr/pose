@@ -110,8 +110,12 @@ func BuiltinPackageManagers() map[string]PackageManager {
 			Remove:  "brew uninstall --cask {packages}",
 		},
 		"cargo": {
-			Check:   `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk -v p={package} '$1 == p { f = 1 } END { exit !f }'`,
-			List:    `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk '/^[^ ]/ { print $1 }'`,
+			// Crate lines look like "name v1.2.3:" or "name v1.2.3 (source):"; both the
+			// bare name and name@version match, so exact pins are found too.
+			Check: `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk -v p={package} ` +
+				`'/^[^ ]/ { v = $2; sub(/^v/, "", v); sub(/:$/, "", v); if ($1 == p || $1 "@" v == p) f = 1 } END { exit !f }'`,
+			List: `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk ` +
+				`'/^[^ ]/ { v = $2; sub(/^v/, "", v); sub(/:$/, "", v); print $1; print $1 "@" v }'`,
 			Install: "cargo install {package}",
 			Remove:  "cargo uninstall {package}",
 		},

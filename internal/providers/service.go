@@ -22,6 +22,8 @@ type ServiceStatus struct {
 	// Static units (no [Install] section, aliases, generated or transient units)
 	// cannot be enabled or disabled; their Enabled value is meaningless.
 	Static bool
+	// Runtime is set for units enabled only until reboot (enable --runtime).
+	Runtime bool
 }
 
 // ServiceManager abstracts systemd and launchd. User-scope operations run as the
@@ -83,8 +85,10 @@ func (s systemd) Status(ctx context.Context, name, scope string) (ServiceStatus,
 	// is-enabled also exits 0 for static, indirect, generated, transient and alias.
 	out := strings.TrimSpace(res.stdout)
 	switch out {
-	case "enabled", "enabled-runtime":
+	case "enabled":
 		st.Enabled = true
+	case "enabled-runtime":
+		st.Enabled, st.Runtime = true, true
 	case "static", "indirect", "generated", "transient", "alias":
 		st.Static = true
 	}
@@ -105,7 +109,12 @@ func (s systemd) Apply(ctx context.Context, name, scope string, active, enabled 
 		return err
 	}
 	if enabled != st.Enabled && !st.Static {
-		if _, err := s.exec(ctx, scope, true, ternary(enabled, "enable", "disable"), name); err != nil {
+		args := []string{ternary(enabled, "enable", "disable"), name}
+		if st.Runtime {
+			// A plain disable leaves runtime links in place.
+			args = []string{"disable", "--runtime", name}
+		}
+		if _, err := s.exec(ctx, scope, true, args...); err != nil {
 			return err
 		}
 	}
@@ -172,7 +181,7 @@ func (l launchd) status(ctx context.Context, name, scope string) (st ServiceStat
 	}
 	hasPlist := statErr == nil
 	st.Exists = loaded || hasPlist
-	st.Enabled = hasPlist && !launchdDisabled(res.stdout, name)
+	st.Enabled = st.Exists && !launchdDisabled(res.stdout, name)
 	return st, loaded, nil
 }
 
@@ -200,10 +209,14 @@ func (l launchd) Apply(ctx context.Context, name, scope string, active, enabled 
 	if (enabled || active) && !st.Exists {
 		return fmt.Errorf("launchd job %s: no plist at %s", name, plist)
 	}
-	if enabled != st.Enabled {
-		if _, err := l.exec(ctx, scope, true, ternary(enabled, "enable", "disable"), target); err != nil {
+	// launchd refuses to bootstrap a disabled job, so it stays enabled at least
+	// until it is loaded and is disabled afterwards if so desired.
+	isEnabled := st.Enabled
+	if !isEnabled && (enabled || active && !loaded) {
+		if _, err := l.exec(ctx, scope, true, "enable", target); err != nil {
 			return err
 		}
+		isEnabled = true
 	}
 	switch {
 	case active && !loaded:
@@ -215,6 +228,11 @@ func (l launchd) Apply(ctx context.Context, name, scope string, active, enabled 
 		}
 	case !active && loaded:
 		if _, err := l.exec(ctx, scope, true, "bootout", target); err != nil {
+			return err
+		}
+	}
+	if isEnabled && !enabled {
+		if _, err := l.exec(ctx, scope, true, "disable", target); err != nil {
 			return err
 		}
 	}

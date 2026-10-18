@@ -134,6 +134,25 @@ func TestListIsCachedUntilMutation(t *testing.T) {
 	}
 }
 
+func TestCargoMatchesPinnedVersion(t *testing.T) {
+	bin := t.TempDir()
+	os.WriteFile(filepath.Join(bin, "cargo"), []byte("#!/bin/sh\nprintf 'ripgrep v14.1.0:\\n    rg\\nfoo v0.1.0 (https://example.com/foo#abc):\\n    foo\\n'\n"), 0o755)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	def := config.BuiltinPackageManagers()["cargo"]
+	ctx := context.Background()
+	for name, def := range map[string]config.PackageManager{"check": {Check: def.Check}, "list": {List: def.List}} {
+		pm := NewPackageManager("cargo", def)
+		for pkg, want := range map[string]bool{
+			"ripgrep": true, "ripgrep@14.1.0": true, "ripgrep@14.0.0": false,
+			"foo@0.1.0": true, "rg": false,
+		} {
+			if got, err := pm.IsInstalled(ctx, pkg); err != nil || got != want {
+				t.Errorf("%s: IsInstalled(%s) = %v, %v", name, pkg, got, err)
+			}
+		}
+	}
+}
+
 func TestSystemdWithoutUserBusIsAnError(t *testing.T) {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		t.Skip("systemctl not installed")

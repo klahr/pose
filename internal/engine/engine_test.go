@@ -467,6 +467,20 @@ func TestPartlySetUpServiceIsNotPruned(t *testing.T) {
 	}
 }
 
+func TestServiceAdoptedWhileStoppedIsPrunedOnceStarted(t *testing.T) {
+	h := newHarness(t)
+	h.svc.units["user:foo"] = &providers.ServiceStatus{Exists: true}
+	h.config("services:\n  - {name: foo, state: stopped}\n")
+	h.mustApply()
+	h.config("services:\n  - {name: foo}\n")
+	h.mustApply()
+
+	h.config("")
+	if k := kinds(h.mustApply())["service:user:foo"]; k != Prune {
+		t.Errorf("service started by pose was planned as %v", k)
+	}
+}
+
 func TestServicePruneFailureIsReportedAndRetried(t *testing.T) {
 	h := newHarness(t)
 	h.config("services:\n  - {name: foo}\n")

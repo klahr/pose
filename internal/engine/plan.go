@@ -385,7 +385,10 @@ func (e *Engine) planServices(ctx context.Context, p *Plan) error {
 			}
 		case !tracked || prior.State != s.State || prior.Enabled == nil || *prior.Enabled != s.Enabled:
 			a.Kind = Adopt
-			a.Adopted = !tracked || prior.Adopted
+			if !tracked {
+				// Matching a stopped, disabled config sets nothing up; pose may start it later.
+				a.Adopted = st.Active || st.Enabled
+			}
 		default:
 			continue
 		}
