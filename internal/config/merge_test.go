@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -160,6 +161,39 @@ func TestLoadRejects(t *testing.T) {
 		if _, err := Load(root, "h"); err != nil {
 			t.Errorf("%q: %v", ok, err)
 		}
+	}
+}
+
+func TestTargetContaining(t *testing.T) {
+	home := t.TempDir()
+	c := &Config{Dotfiles: []Dotfile{{Target: "~/.local/share", TargetPath: filepath.Join(home, ".local", "share")}}}
+	if d, ok := c.TargetContaining(filepath.Join(home, ".local", "share", "pose", "state.json")); !ok || d.Target != "~/.local/share" {
+		t.Errorf("state below a target: %v, %v", d, ok)
+	}
+	if _, ok := c.TargetContaining(filepath.Join(home, ".local", "bin", "pose")); ok {
+		t.Error("sibling of a target reported as contained")
+	}
+}
+
+func TestPacmanListMatchesCheck(t *testing.T) {
+	bin := t.TempDir()
+	os.WriteFile(filepath.Join(bin, "pacman"), []byte(`#!/bin/sh
+case "$*" in
+  -Qi) printf 'Name            : bash\nProvides        : sh\n\nName            : i3-wm\nProvides        : None\n\nName            : libfoo\nProvides        : libfoo.so=1-64  foo-git=2\n' ;;
+  -Sg) printf 'i3\nkde\n' ;;
+  "-Sg i3 kde") printf 'i3 i3-wm\nkde dolphin\nkde i3-wm\n' ;;
+  *) exit 1 ;;
+esac
+`), 0o755)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := exec.Command("/bin/sh", "-c", BuiltinPackageManagers()["pacman"].List).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(out))
+	sort.Strings(got)
+	if want := "bash foo-git i3 i3-wm libfoo libfoo.so sh"; strings.Join(got, " ") != want {
+		t.Errorf("list = %q, want %q", got, want)
 	}
 }
 

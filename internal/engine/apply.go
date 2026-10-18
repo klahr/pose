@@ -18,9 +18,9 @@ import (
 //	link dotfiles → run hooks → apply services
 //
 // State is flushed after every successful action, so an interrupted run resumes
-// cleanly with the next plan. Prune and hook failures are reported at the end
-// (and retried next run) so that one stuck removal does not block the rest;
-// any other failure, and any failure to write state, aborts the run.
+// cleanly with the next plan. Failed actions are reported at the end (and
+// retried next run) so that one bad package or link does not block the rest;
+// only an interrupt or a failure to write state aborts the run.
 func (e *Engine) Apply(ctx context.Context, p *Plan) error {
 	// Bookkeeping that does not touch the system.
 	for _, a := range p.Actions {
@@ -37,7 +37,10 @@ func (e *Engine) Apply(ctx context.Context, p *Plan) error {
 	}
 
 	var errs []error
-	for _, step := range []func(context.Context, *Plan) error{e.pruneServices, e.prunePackages, e.pruneDotfiles} {
+	for _, step := range []func(context.Context, *Plan) error{
+		e.pruneServices, e.prunePackages, e.pruneDotfiles,
+		e.installPackages, e.linkDotfiles, e.runHooks, e.applyServices,
+	} {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
@@ -47,23 +50,6 @@ func (e *Engine) Apply(ctx context.Context, p *Plan) error {
 				return errors.Join(errs...)
 			}
 		}
-	}
-	for _, step := range []func(context.Context, *Plan) error{e.installPackages, e.linkDotfiles} {
-		if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
-		}
-		if err := step(ctx, p); err != nil {
-			return errors.Join(append(errs, err)...)
-		}
-	}
-	if err := e.runHooks(ctx, p); err != nil {
-		errs = append(errs, err)
-		if errors.Is(err, state.ErrSave) || ctx.Err() != nil {
-			return errors.Join(errs...)
-		}
-	}
-	if err := e.applyServices(ctx, p); err != nil {
-		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -194,8 +180,10 @@ func (e *Engine) pruneDotfiles(_ context.Context, p *Plan) error {
 	return errors.Join(errs...)
 }
 
+// linkDotfiles keeps going past failed links; see Apply.
 func (e *Engine) linkDotfiles(_ context.Context, p *Plan) error {
 	now := time.Now()
+	var errs []error
 	for _, a := range p.filter(state.TypeDotfile, Link, Update) {
 		e.ui.Step(a, "linking")
 		backup, err := providers.LinkDotfile(a.SourcePath, a.TargetPath, now)
@@ -203,7 +191,9 @@ func (e *Engine) linkDotfiles(_ context.Context, p *Plan) error {
 			e.ui.Note("backed up existing file to %s", backup)
 		}
 		if err != nil {
-			return err
+			a.Hook = false // not linked, so its hook must not run or be recorded
+			errs = append(errs, err)
+			continue
 		}
 		// Keep the first backup while it exists: it holds the file from before pose,
 		// later ones what an app wrote over the link. On the action, so runHooks
@@ -217,10 +207,10 @@ func (e *Engine) linkDotfiles(_ context.Context, p *Plan) error {
 			r.Hash = a.PrevHash
 		}
 		if err := e.store.Put(a.Key, r); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // runHooks runs each distinct on_change command once, in config order.
@@ -240,7 +230,7 @@ func (e *Engine) runHooks(ctx context.Context, p *Plan) error {
 	var errs []error
 	for _, cmd := range commands {
 		if ctx.Err() != nil {
-			return errors.Join(append(errs, ctx.Err())...)
+			break
 		}
 		e.ui.StepGroup(Update, fmt.Sprintf("running hook %q", cmd))
 		if err := providers.RunHook(ctx, cmd, e.cfg.Root); err != nil {
@@ -258,6 +248,7 @@ func (e *Engine) runHooks(ctx context.Context, p *Plan) error {
 	return errors.Join(errs...)
 }
 
+// applyServices keeps going past failed services; see Apply.
 func (e *Engine) applyServices(ctx context.Context, p *Plan) error {
 	actions := p.filter(state.TypeService, Update)
 	reloaded := map[string]bool{}
@@ -269,14 +260,19 @@ func (e *Engine) applyServices(ctx context.Context, p *Plan) error {
 			reloaded[a.Scope] = true
 		}
 	}
+	var errs []error
 	for _, a := range actions {
+		if ctx.Err() != nil {
+			break
+		}
 		e.ui.Step(a, "updating")
 		if err := e.services.Apply(ctx, a.Name, a.Scope, a.Active, a.Enabled); err != nil {
-			return fmt.Errorf("apply service %s: %w", a.Name, err)
+			errs = append(errs, fmt.Errorf("apply service %s: %w", a.Name, err))
+			continue
 		}
 		if err := e.store.Put(a.Key, a.resource()); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

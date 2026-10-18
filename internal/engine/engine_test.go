@@ -246,6 +246,82 @@ packages:
 	}
 }
 
+func TestMovingPackageBetweenManagersKeepsIt(t *testing.T) {
+	h := newHarness(t)
+	// "aur" shares the fake manager's database, like pacman and an AUR helper.
+	h.config("    aur:\n      check: \"test -f " + h.db + "/{package}\"\n      install: \"cd " + h.db + " && touch {packages}\"\n      remove: \"cd " + h.db + " && rm {packages}\"\npackages:\n  fake: [a]\n")
+	h.mustApply()
+
+	h.config("    aur:\n      check: \"test -f " + h.db + "/{package}\"\n      install: \"cd " + h.db + " && touch {packages}\"\n      remove: \"cd " + h.db + " && rm {packages}\"\npackages:\n  aur: [a]\n")
+	p := h.mustApply()
+	if k := kinds(p); k["package:fake:a"] != Forget || k["package:aur:a"] != Adopt {
+		t.Fatalf("move plan = %v", k)
+	}
+	if !h.installed("a") {
+		t.Fatal("moved package was uninstalled")
+	}
+	if r, _ := h.stateResource("package:aur:a"); r.Adopted {
+		t.Error("pose installed the package, but the moved entry is marked adopted")
+	}
+}
+
+func TestInterruptedPlanReportsOnce(t *testing.T) {
+	h := newHarness(t)
+	h.config("packages:\n  fake: [a, b, c, d, e, f, g, h, i, j]\n")
+	cfg, err := config.Load(h.root, "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.Open(h.state, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(cfg, store, NewUI(os.Stderr, os.Stderr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.Plan(ctx); err != context.Canceled {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestFailedInstallDoesNotBlockLinksOrServices(t *testing.T) {
+	h := newHarness(t)
+	h.write("files/a", "a")
+	h.write("files/b", "b")
+	ro := filepath.Join(h.home, "ro") // ~/ro/.b cannot be created
+	if err := os.Mkdir(ro, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.units["user:foo"] = &providers.ServiceStatus{Exists: true}
+	h.config(`packages:
+  fake: [ok, "bad/name"]
+dotfiles:
+  - {source: ./files/b, target: ~/ro/.b, on_change: touch hook-ran}
+  - {source: ./files/a, target: ~/.a}
+services:
+  - {name: foo}
+`)
+	_, err := h.run(true)
+	if err == nil || !strings.Contains(err.Error(), "installing fake") || !strings.Contains(err.Error(), "ro/.b") {
+		t.Fatalf("apply error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(h.home, ".a")); err != nil {
+		t.Error("link was blocked by the failed install or link")
+	}
+	if u := h.svc.units["user:foo"]; !u.Active {
+		t.Error("service was blocked by the failed install or link")
+	}
+	if _, err := os.Stat(filepath.Join(h.root, "hook-ran")); err == nil {
+		t.Error("hook ran for a dotfile that failed to link")
+	}
+	if _, ok := h.stateResource("dotfile:~/ro/.b"); ok {
+		t.Error("failed link recorded in state")
+	}
+}
+
 func TestDotfileEditWithoutHookIsNoChange(t *testing.T) {
 	h := newHarness(t)
 	h.write("files/a", "1")
@@ -370,6 +446,23 @@ func TestAdoptedServiceIsNotPruned(t *testing.T) {
 		t.Fatalf("prune plan = %v", k)
 	}
 	if len(h.svc.pruned) != 1 || h.svc.pruned[0] != "user:mine" {
+		t.Errorf("pruned = %v", h.svc.pruned)
+	}
+}
+
+func TestPartlySetUpServiceIsNotPruned(t *testing.T) {
+	h := newHarness(t)
+	h.svc.units["user:pre"] = &providers.ServiceStatus{Exists: true, Active: true} // running, not enabled
+	h.config("services:\n  - {name: pre}\n")
+	if k := kinds(h.mustApply())["service:user:pre"]; k != Update {
+		t.Fatalf("kind = %v", k)
+	}
+
+	h.config("")
+	if k := kinds(h.mustApply())["service:user:pre"]; k != Forget {
+		t.Errorf("service running before pose was planned as %v", k)
+	}
+	if len(h.svc.pruned) != 0 {
 		t.Errorf("pruned = %v", h.svc.pruned)
 	}
 }

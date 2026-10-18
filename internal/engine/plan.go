@@ -182,6 +182,10 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 	parallel(len(items), 8, func(i int) {
 		installed[i], errs[i] = e.packages[items[i].mgr].IsInstalled(ctx, items[i].pkg)
 	})
+	// Interrupted: every check still running failed with it, so report it once.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// A package only left to prune must not block every run once its manager is
 	// gone; there is nothing left to uninstall it with.
 	missing := make([]bool, len(items))
@@ -194,20 +198,44 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 		return err
 	}
 
+	// A package moved to another manager can still look installed under the old
+	// one when both share a backend (pacman and an AUR helper); pruning it there
+	// would uninstall what the config still declares. moved maps such names to
+	// whether the old entry was adopted, which the new entry inherits.
+	desiredNames := map[string]bool{}
+	for _, it := range items {
+		if it.desired {
+			desiredNames[it.pkg] = true
+		}
+	}
+	moved := map[string]bool{}
+	for i, it := range items {
+		if !it.desired && installed[i] && desiredNames[it.pkg] {
+			moved[it.pkg] = moved[it.pkg] || it.adopted
+		}
+	}
+
 	for i, it := range items {
 		_, tracked := e.store.State.Resources[it.key]
 		a := &Action{Type: state.TypePackage, Key: it.key, Name: it.pkg, Manager: it.mgr}
 		switch {
 		case it.desired && !installed[i]:
-			a.Kind = Install
+			a.Kind, a.Adopted = Install, moved[it.pkg]
 		case it.desired && !tracked:
 			a.Kind, a.Adopted = Adopt, true
+			if adopted, ok := moved[it.pkg]; ok {
+				a.Adopted = adopted
+			}
 		case it.desired:
 			continue
 		case missing[i]:
 			a.Kind = Forget
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
 				"package %q (%s) is no longer in config, but package manager %q is not available; forgetting it without uninstalling", it.pkg, it.mgr, it.mgr))
+		case installed[i] && desiredNames[it.pkg]:
+			a.Kind = Forget
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"package %q is now declared under another package manager; leaving it installed via %s", it.pkg, it.mgr))
 		case installed[i] && it.adopted:
 			a.Kind = Forget
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
@@ -342,6 +370,10 @@ func (e *Engine) planServices(ctx context.Context, p *Plan) error {
 		switch {
 		case st.Active != active || enabledDiffers:
 			a.Kind = Update
+			if !tracked {
+				// Already running or enabled before pose: pruning must not undo that.
+				a.Adopted = st.Active || st.Enabled
+			}
 			if st.Active != active {
 				a.Notes = append(a.Notes, fmt.Sprintf("state: %s -> %s", stateWord(st.Active), s.State))
 			}

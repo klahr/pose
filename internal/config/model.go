@@ -77,6 +77,16 @@ func BuiltinPackageManagers() map[string]PackageManager {
 			Check: `pacman -Q {package} >/dev/null 2>&1 || ` +
 				`{ g=$(pacman -Sqg {package} 2>/dev/null) && [ -n "$g" ] && pacman -T $g >/dev/null 2>&1; } || ` +
 				`{ command -v pacman >/dev/null 2>&1 || exit 127; exit 1; }`,
+			// The same answers as check in one query: installed names, what they
+			// provide (pacman -Q matches those too), and groups whose members all are.
+			List: `command -v pacman >/dev/null 2>&1 || exit 127; ` +
+				`q=$(LC_ALL=C pacman -Qi) && g=$(pacman -Sg) && g=$(pacman -Sg $g) || exit; ` +
+				`printf '%s\n--\n%s\n' "$q" "$g" | awk '` +
+				`$0 == "--" { s = 1; next } ` +
+				`!s && $1 == "Name" { i[$3] = 1; print $3 } ` +
+				`!s && $1 == "Provides" && $3 != "None" { for (k = 3; k <= NF; k++) { sub(/=.*/, "", $k); i[$k] = 1; print $k } } ` +
+				`s && NF == 2 { g[$1] = 1; if (!($2 in i)) m[$1] = 1 } ` +
+				`END { for (x in g) if (!(x in m)) print x }'`,
 			Install: "sudo pacman -S --needed --noconfirm {packages}",
 			Remove:  "sudo pacman -Rns --noconfirm {packages}",
 		},

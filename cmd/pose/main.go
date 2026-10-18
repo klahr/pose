@@ -264,6 +264,16 @@ func load(ui *engine.UI, opts options, lock bool) (*engine.Engine, *state.Store,
 	if err != nil {
 		return nil, nil, err
 	}
+	// Linking over either would move it into a backup and redirect it into the repository.
+	protected := []string{path}
+	if exe, err := os.Executable(); err == nil {
+		protected = append(protected, exe)
+	}
+	for _, p := range protected {
+		if d, ok := cfg.TargetContaining(p); ok {
+			return nil, nil, fmt.Errorf("dotfile %s: target must not contain %s", d.Target, config.ContractHome(p, home))
+		}
+	}
 	store, err := state.Open(path, lock)
 	if err != nil {
 		return nil, nil, err

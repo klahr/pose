@@ -293,6 +293,19 @@ func validateTemplates(pm PackageManager) error {
 	return errors.Join(errs...)
 }
 
+// TargetContaining returns the dotfile whose target is p or one of its parents,
+// comparing real paths too, like the repository overlap check in validate.
+func (c *Config) TargetContaining(p string) (Dotfile, bool) {
+	realP := resolveExisting(p)
+	for _, d := range c.Dotfiles {
+		realTarget := filepath.Join(resolveExisting(filepath.Dir(d.TargetPath)), filepath.Base(d.TargetPath))
+		if within(p, d.TargetPath) || within(realP, realTarget) {
+			return d, true
+		}
+	}
+	return Dotfile{}, false
+}
+
 // within reports whether p is dir or lies below it.
 func within(p, dir string) bool {
 	rel, err := filepath.Rel(dir, p)

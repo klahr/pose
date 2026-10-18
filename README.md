@@ -1,7 +1,7 @@
 # pose
 
 Declarative, Terraform-style reconciler for packages, dotfiles and services on
-Linux and macOS, driven by a single Git repository.
+Linux, driven by a single Git repository.
 
 You describe the machine in YAML, `pose plan` shows what differs, and
 `pose apply` makes it so. Things already on the machine are adopted, not
@@ -95,7 +95,7 @@ packages:
 ```
 
 Built-in package managers: `pacman` (groups such as `base-devel` count as
-installed once all members are), `apt`, `brew`, `brew-cask`, `cargo`.
+installed once all members are), `apt`, `brew`, `cargo`.
 
 Others can be declared under `providers.package_managers` with `check`,
 `install` and `remove` command templates, and optionally `list`, which prints
@@ -138,8 +138,8 @@ source content changes (and once when the hook is added). Sources must exist:
 a missing source is a configuration error, not a removal.
 
 Links are created without `sudo`, so dotfiles are for your home directory, not
-`/etc`. Changing a linked systemd unit or launchd plist does not reload or
-restart the service by itself; use `on_change` for that, e.g.
+`/etc`. Changing a linked systemd unit does not reload or restart the service
+by itself; use `on_change` for that, e.g.
 `systemctl --user daemon-reload && systemctl --user restart syncthing`.
 
 ### Services
@@ -154,9 +154,8 @@ services:
 
 pose only starts, stops, enables and disables units; it does not install them.
 Declare the package that ships the unit too (packages are installed before
-services are applied). For launchd, a job counts as `active` while it is
-loaded, whether or not its process is running at the moment. Static systemd
-units, which have no `[Install]` section, ignore `enabled`.
+services are applied). Static systemd units, which have no `[Install]` section,
+ignore `enabled`.
 
 ## State, adoption and removal
 
@@ -167,9 +166,11 @@ State lives in `$XDG_DATA_HOME/pose/state.json` (default
 whatever it no longer sees in the config. For a dotfile, delete the entry
 first and the source file after applying. With these exceptions:
 
-- Packages and services that already matched the config when pose first saw
-  them are *adopted*: removing them from config only forgets them, never
-  uninstalls or stops them.
+- Packages that were already installed, and services that were already running
+  or enabled, when pose first saw them are *adopted*: removing them from config
+  only forgets them, never uninstalls or stops them.
+- Moving a package to another package manager forgets it under the old one
+  instead of uninstalling it.
 - A file that was backed up when a dotfile was linked is moved back when that
   dotfile is pruned.
 - A package whose manager is no longer installed (its check or list exits
