@@ -16,6 +16,9 @@ func Merge(dst, src *Config) {
 		if pm.Check != "" {
 			cur.Check = pm.Check
 		}
+		if pm.List != "" {
+			cur.List = pm.List
+		}
 		if pm.Install != "" {
 			cur.Install = pm.Install
 		}

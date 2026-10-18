@@ -19,6 +19,9 @@ type ServiceStatus struct {
 	Exists  bool // the init system knows the unit / a plist is installed
 	Active  bool
 	Enabled bool
+	// Static units (no [Install] section, aliases, generated or transient units)
+	// cannot be enabled or disabled; their Enabled value is meaningless.
+	Static bool
 }
 
 // ServiceManager abstracts systemd and launchd. User-scope operations run as the
@@ -75,8 +78,14 @@ func (s systemd) Status(ctx context.Context, name, scope string) (ServiceStatus,
 	if err != nil && !exitedNonZero(err) {
 		return ServiceStatus{}, err
 	}
-	st.Enabled = err == nil
+	// is-enabled also exits 0 for static, indirect, generated, transient and alias.
 	out := strings.TrimSpace(res.stdout)
+	switch out {
+	case "enabled", "enabled-runtime":
+		st.Enabled = true
+	case "static", "indirect", "generated", "transient", "alias":
+		st.Static = true
+	}
 	if out == "not-found" || strings.Contains(res.stderr, "No such file") || strings.Contains(res.stderr, "not found") {
 		st.Exists = false
 	}
@@ -93,7 +102,7 @@ func (s systemd) Apply(ctx context.Context, name, scope string, active, enabled 
 	if err != nil {
 		return err
 	}
-	if enabled != st.Enabled {
+	if enabled != st.Enabled && !st.Static {
 		if _, err := s.exec(ctx, scope, true, ternary(enabled, "enable", "disable"), name); err != nil {
 			return err
 		}
@@ -111,7 +120,9 @@ func (s systemd) Prune(ctx context.Context, name, scope string) error {
 }
 
 // launchd. The service name is the job label; its plist is expected in
-// ~/Library/LaunchAgents (user) or /Library/LaunchDaemons (system).
+// ~/Library/LaunchAgents (user) or /Library/LaunchDaemons (system). A job counts
+// as active while it is loaded (bootstrapped) in its domain, whether or not a
+// process is running right now: on-demand and periodic jobs exit between runs.
 
 type launchd struct {
 	uid  int
@@ -147,7 +158,7 @@ func (l launchd) status(ctx context.Context, name, scope string) (st ServiceStat
 		return st, false, err
 	}
 	loaded = err == nil
-	st.Active = loaded && strings.Contains(res.stdout, "state = running")
+	st.Active = loaded
 
 	res, err = l.exec(ctx, scope, false, "print-disabled", l.domain(scope))
 	if err != nil {
@@ -193,11 +204,9 @@ func (l launchd) Apply(ctx context.Context, name, scope string, active, enabled 
 		}
 	}
 	switch {
-	case active && !st.Active:
-		if !loaded {
-			if _, err := l.exec(ctx, scope, true, "bootstrap", l.domain(scope), plist); err != nil {
-				return err
-			}
+	case active && !loaded:
+		if _, err := l.exec(ctx, scope, true, "bootstrap", l.domain(scope), plist); err != nil {
+			return err
 		}
 		if _, err := l.exec(ctx, scope, true, "kickstart", target); err != nil {
 			return err

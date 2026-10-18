@@ -29,8 +29,16 @@ type Providers struct {
 
 // PackageManager is a CLI contract. Templates may use {package} (one name) and,
 // for install and remove, {packages} (all names at once, enabling batching).
+// List, when set, prints every installed package one per line and replaces the
+// per-package check, so managers with slow queries are asked only once.
+//
+// Check and list must exit 126 or 127 when the manager itself is missing (the
+// shell does this for "command not found"); any other failure of check means
+// "not installed". Guard pipelines with `command -v`, since a pipeline's
+// status is that of its last command.
 type PackageManager struct {
 	Check   string `yaml:"check"`
+	List    string `yaml:"list"`
 	Install string `yaml:"install"`
 	Remove  string `yaml:"remove"`
 }
@@ -64,22 +72,36 @@ func (s Service) Key() string { return s.Scope + ":" + s.Name }
 func BuiltinPackageManagers() map[string]PackageManager {
 	return map[string]PackageManager{
 		"pacman": {
-			Check:   "pacman -Q {package} >/dev/null 2>&1",
+			// Groups such as base-devel are not packages; they count as
+			// installed once all of their members are.
+			Check: `pacman -Q {package} >/dev/null 2>&1 || ` +
+				`{ g=$(pacman -Sqg {package} 2>/dev/null) && [ -n "$g" ] && pacman -T $g >/dev/null 2>&1; } || ` +
+				`{ command -v pacman >/dev/null 2>&1 || exit 127; exit 1; }`,
 			Install: "sudo pacman -S --needed --noconfirm {packages}",
 			Remove:  "sudo pacman -Rns --noconfirm {packages}",
 		},
 		"apt": {
-			Check:   "dpkg -s {package} >/dev/null 2>&1",
+			// dpkg -s also succeeds for removed packages whose config files remain.
+			Check:   `command -v dpkg-query >/dev/null 2>&1 || exit 127; dpkg-query -W -f='${db:Status-Status}' {package} 2>/dev/null | grep -qx installed`,
 			Install: "sudo apt-get install -y {packages}",
 			Remove:  "sudo apt-get purge -y {packages}",
 		},
 		"brew": {
-			Check:   "brew list --formula | grep -qxF {package}",
-			Install: "brew install {packages}",
-			Remove:  "brew uninstall {packages}",
+			// Both short and tap-qualified names, so either form matches.
+			Check:   "brew list --formula {package} >/dev/null 2>&1",
+			List:    "brew list --formula -1 && brew list --formula -1 --full-name",
+			Install: "brew install --formula {packages}",
+			Remove:  "brew uninstall --formula {packages}",
+		},
+		"brew-cask": {
+			Check:   "brew list --cask {package} >/dev/null 2>&1",
+			List:    "brew list --cask -1 && brew list --cask -1 --full-name",
+			Install: "brew install --cask {packages}",
+			Remove:  "brew uninstall --cask {packages}",
 		},
 		"cargo": {
-			Check:   "cargo install --list | grep -q '^'{package}' '",
+			Check:   `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk -v p={package} '$1 == p { f = 1 } END { exit !f }'`,
+			List:    `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk '/^[^ ]/ { print $1 }'`,
 			Install: "cargo install {package}",
 			Remove:  "cargo uninstall {package}",
 		},

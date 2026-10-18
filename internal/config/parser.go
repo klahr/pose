@@ -222,15 +222,26 @@ func (c *Config) validate() error {
 		}
 	}
 
-	for _, d := range c.Dotfiles {
+	// Compare against real paths too: a symlinked parent (including another
+	// managed dotfile) can place a lexically harmless target inside the repository.
+	realRoot := resolveExisting(c.Root)
+	for i, d := range c.Dotfiles {
 		if _, err := os.Stat(d.SourcePath); err != nil {
 			errs = append(errs, fmt.Errorf("dotfile %s: source %s: %w", d.Target, d.Source, unwrapPathError(err)))
 		}
 		if !within(d.TargetPath, c.Home) || d.TargetPath == c.Home {
 			errs = append(errs, fmt.Errorf("dotfile %s: target must be inside %s", d.Target, c.Home))
 		}
-		if within(d.TargetPath, c.Root) || within(c.Root, d.TargetPath) {
+		// The target itself may already be our symlink, so only its parent is resolved.
+		realTarget := filepath.Join(resolveExisting(filepath.Dir(d.TargetPath)), filepath.Base(d.TargetPath))
+		if within(d.TargetPath, c.Root) || within(c.Root, d.TargetPath) ||
+			within(realTarget, realRoot) || within(realRoot, realTarget) {
 			errs = append(errs, fmt.Errorf("dotfile %s: target must not overlap the repository %s", d.Target, c.Root))
+		}
+		for _, o := range c.Dotfiles[:i] {
+			if within(d.TargetPath, o.TargetPath) || within(o.TargetPath, d.TargetPath) {
+				errs = append(errs, fmt.Errorf("dotfile %s: target is nested with %s; links would be created through each other", d.Target, o.Target))
+			}
 		}
 	}
 
@@ -250,8 +261,8 @@ func (c *Config) validate() error {
 
 func validateTemplates(pm PackageManager) error {
 	var errs []error
-	if !strings.Contains(pm.Check, "{package}") {
-		errs = append(errs, errors.New("check must contain {package}"))
+	if pm.List == "" && !strings.Contains(pm.Check, "{package}") {
+		errs = append(errs, errors.New("check must contain {package} (or define list)"))
 	}
 	for name, tmpl := range map[string]string{"install": pm.Install, "remove": pm.Remove} {
 		if !strings.Contains(tmpl, "{package}") && !strings.Contains(tmpl, "{packages}") {
@@ -265,6 +276,23 @@ func validateTemplates(pm PackageManager) error {
 func within(p, dir string) bool {
 	rel, err := filepath.Rel(dir, p)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveExisting resolves symlinks in the longest existing prefix of p and
+// appends the remainder unchanged.
+func resolveExisting(p string) string {
+	rest := ""
+	for {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(real, rest)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return filepath.Join(p, rest)
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+		p = parent
+	}
 }
 
 func unwrapPathError(err error) error {

@@ -17,8 +17,9 @@ import (
 //	link dotfiles → run hooks → apply services
 //
 // State is flushed after every successful action, so an interrupted run resumes
-// cleanly with the next plan. The first failure aborts the run, except hook
-// failures, which are reported at the end (and retried next run).
+// cleanly with the next plan. Prune and hook failures are reported at the end
+// (and retried next run) so that one stuck removal does not block the rest;
+// any other failure, and any failure to write state, aborts the run.
 func (e *Engine) Apply(ctx context.Context, p *Plan) error {
 	// Bookkeeping that does not touch the system.
 	for _, a := range p.Actions {
@@ -34,39 +35,55 @@ func (e *Engine) Apply(ctx context.Context, p *Plan) error {
 		}
 	}
 
-	steps := []func(context.Context, *Plan) error{
-		e.pruneServices,
-		e.prunePackages,
-		e.pruneDotfiles,
-		e.installPackages,
-		e.linkDotfiles,
-	}
-	for _, step := range steps {
+	var errs []error
+	for _, step := range []func(context.Context, *Plan) error{e.pruneServices, e.prunePackages, e.pruneDotfiles} {
 		if err := ctx.Err(); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 		if err := step(ctx, p); err != nil {
-			return err
+			errs = append(errs, err)
+			if errors.Is(err, state.ErrSave) {
+				return errors.Join(errs...)
+			}
 		}
 	}
-	hookErr := e.runHooks(ctx, p)
-	if err := e.applyServices(ctx, p); err != nil {
-		return errors.Join(hookErr, err)
+	for _, step := range []func(context.Context, *Plan) error{e.installPackages, e.linkDotfiles} {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if err := step(ctx, p); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 	}
-	return hookErr
+	if err := e.runHooks(ctx, p); err != nil {
+		errs = append(errs, err)
+		if errors.Is(err, state.ErrSave) || ctx.Err() != nil {
+			return errors.Join(errs...)
+		}
+	}
+	if err := e.applyServices(ctx, p); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
+// pruneServices keeps going past failed services; see Apply.
 func (e *Engine) pruneServices(ctx context.Context, p *Plan) error {
+	var errs []error
 	for _, a := range p.filter(state.TypeService, Prune) {
+		if ctx.Err() != nil {
+			break
+		}
 		e.ui.Step(a, "stopping and disabling")
 		if err := e.services.Prune(ctx, a.Name, a.Scope); err != nil {
-			return fmt.Errorf("prune service %s: %w", a.Name, err)
+			errs = append(errs, fmt.Errorf("prune service %s: %w", a.Name, err))
+			continue
 		}
 		if err := e.store.Delete(a.Key); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (e *Engine) prunePackages(ctx context.Context, p *Plan) error {
@@ -78,7 +95,8 @@ func (e *Engine) installPackages(ctx context.Context, p *Plan) error {
 }
 
 // mutatePackages installs or removes packages, batched per manager. After a
-// failed batch every package is re-checked so state reflects partial progress.
+// failed batch every package is re-checked so state reflects partial progress,
+// and the remaining managers still run; their failures are joined.
 func (e *Engine) mutatePackages(ctx context.Context, actions []*Action, install bool) error {
 	var managers []string
 	byManager := map[string][]*Action{}
@@ -93,7 +111,11 @@ func (e *Engine) mutatePackages(ctx context.Context, actions []*Action, install 
 	if install {
 		verb = "installing"
 	}
+	var errs []error
 	for _, mgr := range managers {
+		if ctx.Err() != nil {
+			break
+		}
 		group := byManager[mgr]
 		pm := e.packages[mgr]
 		names := make([]string, len(group))
@@ -112,13 +134,16 @@ func (e *Engine) mutatePackages(ctx context.Context, actions []*Action, install 
 		done := group
 		if err != nil {
 			done = nil
+			// Use a fresh context, as the run may have been interrupted, but
+			// bound it so a hanging check cannot block the exit.
+			cctx, cancel := context.WithTimeout(context.Background(), recheckTimeout)
 			for _, a := range group {
-				// Use a fresh context: the run may have been interrupted.
-				ok, cerr := pm.IsInstalled(context.Background(), a.Name)
+				ok, cerr := pm.IsInstalled(cctx, a.Name)
 				if cerr == nil && ok == install {
 					done = append(done, a)
 				}
 			}
+			cancel()
 		}
 		if serr := e.store.Update(func(st *state.State) {
 			for _, a := range done {
@@ -129,30 +154,43 @@ func (e *Engine) mutatePackages(ctx context.Context, actions []*Action, install 
 				}
 			}
 		}); serr != nil {
-			return errors.Join(err, serr)
+			return errors.Join(append(errs, err, serr)...)
 		}
 		if err != nil {
-			return fmt.Errorf("%s %s packages: %w", verb, mgr, err)
+			errs = append(errs, fmt.Errorf("%s %s packages: %w", verb, mgr, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
+const recheckTimeout = 30 * time.Second
+
+// pruneDotfiles keeps going past failed dotfiles; see Apply.
 func (e *Engine) pruneDotfiles(_ context.Context, p *Plan) error {
+	var errs []error
 	for _, a := range p.filter(state.TypeDotfile, Prune) {
 		e.ui.Step(a, "removing symlink")
 		removed, err := providers.UnlinkDotfile(a.SourcePath, a.TargetPath)
 		if err != nil {
-			return err
+			errs = append(errs, err)
+			continue
 		}
 		if !removed {
 			e.ui.Warn("%s changed since planning; left in place", a.Target)
+		} else if a.Backup != "" {
+			restored, err := providers.RestoreBackup(a.Backup, a.TargetPath)
+			if err != nil {
+				// The symlink is gone either way; report and stop tracking it.
+				errs = append(errs, err)
+			} else if restored {
+				e.ui.Note("restored %s from %s", a.Target, a.Backup)
+			}
 		}
 		if err := e.store.Delete(a.Key); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (e *Engine) linkDotfiles(_ context.Context, p *Plan) error {
@@ -165,6 +203,9 @@ func (e *Engine) linkDotfiles(_ context.Context, p *Plan) error {
 		}
 		if err != nil {
 			return err
+		}
+		if backup != "" {
+			a.Backup = backup // on the action, so runHooks records it too
 		}
 		r := a.resource()
 		if a.Hook {

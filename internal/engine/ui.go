@@ -20,14 +20,19 @@ const (
 )
 
 type UI struct {
-	out   io.Writer
-	color bool
+	out      io.Writer
+	errOut   io.Writer
+	color    bool
+	errColor bool
 }
 
-// NewUI writes to f, using color when f is a terminal and NO_COLOR is unset.
-func NewUI(f *os.File) *UI {
-	color := IsTerminal(f) && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
-	return &UI{out: f, color: color}
+// NewUI writes to out and errors to errOut, using color on each when it is a
+// terminal and NO_COLOR is unset.
+func NewUI(out, errOut *os.File) *UI {
+	useColor := func(f *os.File) bool {
+		return IsTerminal(f) && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
+	}
+	return &UI{out: out, errOut: errOut, color: useColor(out), errColor: useColor(errOut)}
 }
 
 // IsTerminal reports whether f is a TTY (not merely a character device like /dev/null).
@@ -55,7 +60,11 @@ func (u *UI) Warn(format string, args ...any) {
 }
 
 func (u *UI) Error(format string, args ...any) {
-	fmt.Fprintf(u.out, "%s %s\n", u.paint(ansiRed+ansiBold, "[x]"), fmt.Sprintf(format, args...))
+	tag := "[x]"
+	if u.errColor {
+		tag = ansiRed + ansiBold + tag + ansiReset
+	}
+	fmt.Fprintf(u.errOut, "%s %s\n", tag, fmt.Sprintf(format, args...))
 }
 
 func (u *UI) Note(format string, args ...any) {

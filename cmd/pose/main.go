@@ -29,10 +29,14 @@ Usage:
   pose state list [flags]   list resources tracked in the state file
   pose version
 
-Flags:
+Flags (-C, --dir, --host, --state and --force-host may also precede the command):
   -C, --dir DIR        configuration repository (default $POSE_DIR or ~/.dotfiles)
-      --host NAME      host overlay to use (default: short hostname)
+      --host NAME      host overlay to use (default: short hostname); when given,
+                       hosts/NAME.yaml must exist
       --state FILE     state file (default $XDG_DATA_HOME/pose/state.json)
+      --force-host     accept a state file last written for a different host
+                       (after a hostname change); resources only in the old
+                       host's config will be pruned
   -y, --yes            apply: skip the confirmation prompt
       --detailed-exitcode
                        plan: exit 2 when there are changes, 0 when there are none
@@ -43,6 +47,7 @@ Environment:
 
 type options struct {
 	dir, host, statePath string
+	forceHost            bool
 	yes                  bool
 	detailedExitCode     bool
 }
@@ -52,6 +57,14 @@ func main() {
 }
 
 func run(args []string) int {
+	var opts options
+	if len(args) > 0 && strings.HasPrefix(args[0], "-") && !isMeta(args[0]) {
+		fs := newFlagSet("", &opts)
+		if code, ok := parseFlags(fs, "pose", args); !ok {
+			return code
+		}
+		args = fs.Args()
+	}
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		return 2
@@ -78,36 +91,23 @@ func run(args []string) int {
 		return 2
 	}
 
-	var opts options
-	fs := flag.NewFlagSet("pose "+cmd, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.StringVar(&opts.dir, "C", "", "")
-	fs.StringVar(&opts.dir, "dir", "", "")
-	fs.StringVar(&opts.host, "host", "", "")
-	fs.StringVar(&opts.statePath, "state", "", "")
-	if cmd == "apply" {
-		fs.BoolVar(&opts.yes, "y", false, "")
-		fs.BoolVar(&opts.yes, "yes", false, "")
-	}
-	if cmd == "plan" {
-		fs.BoolVar(&opts.detailedExitCode, "detailed-exitcode", false, "")
-	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			fmt.Print(usage)
-			return 0
-		}
-		fmt.Fprintf(os.Stderr, "pose %s: %v\n", cmd, err)
-		return 2
+	fs := newFlagSet(cmd, &opts)
+	if code, ok := parseFlags(fs, "pose "+cmd, args); !ok {
+		return code
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "pose %s: unexpected argument %q\n", cmd, fs.Arg(0))
 		return 2
 	}
 
-	ui := engine.NewUI(os.Stdout)
+	ui := engine.NewUI(os.Stdout, os.Stderr)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// After the first interrupt, restore default handling so a second one exits immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	var err error
 	code := 0
@@ -124,6 +124,49 @@ func run(args []string) int {
 		return 1
 	}
 	return code
+}
+
+func isMeta(arg string) bool {
+	switch arg {
+	case "-h", "-help", "--help", "-version", "--version":
+		return true
+	}
+	return false
+}
+
+// newFlagSet registers the global flags plus those of cmd ("" for flags given
+// before the command). Current values serve as defaults, so flags given before
+// the command survive the second parse.
+func newFlagSet(cmd string, opts *options) *flag.FlagSet {
+	fs := flag.NewFlagSet("pose "+cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&opts.dir, "C", opts.dir, "")
+	fs.StringVar(&opts.dir, "dir", opts.dir, "")
+	fs.StringVar(&opts.host, "host", opts.host, "")
+	fs.StringVar(&opts.statePath, "state", opts.statePath, "")
+	fs.BoolVar(&opts.forceHost, "force-host", opts.forceHost, "")
+	switch cmd {
+	case "apply":
+		fs.BoolVar(&opts.yes, "y", false, "")
+		fs.BoolVar(&opts.yes, "yes", false, "")
+	case "plan":
+		fs.BoolVar(&opts.detailedExitCode, "detailed-exitcode", false, "")
+	}
+	return fs
+}
+
+// parseFlags parses args into fs. When it returns false, the caller exits with code.
+func parseFlags(fs *flag.FlagSet, prefix string, args []string) (code int, ok bool) {
+	err := fs.Parse(args)
+	switch {
+	case err == nil:
+		return 0, true
+	case errors.Is(err, flag.ErrHelp):
+		fmt.Print(usage)
+		return 0, false
+	}
+	fmt.Fprintf(os.Stderr, "%s: %v\n", prefix, err)
+	return 2, false
 }
 
 func statePath(opts options) (string, error) {
@@ -160,6 +203,12 @@ func load(ui *engine.UI, opts options, lock bool) (*engine.Engine, *state.Store,
 	if err != nil {
 		return nil, nil, err
 	}
+	// A mistyped --host would otherwise silently drop the host's overlay, and
+	// apply would prune everything it declares.
+	if opts.host != "" && cfg.HostFile == "" {
+		return nil, nil, fmt.Errorf("--host %s: no overlay %s",
+			host, config.ContractHome(filepath.Join(cfg.Root, config.HostsDir, host+".yaml"), home))
+	}
 	if cfg.HostFile != "" {
 		ui.Info("Merged host overlay %s", config.ContractHome(cfg.HostFile, home))
 	}
@@ -173,6 +222,12 @@ func load(ui *engine.UI, opts options, lock bool) (*engine.Engine, *state.Store,
 		return nil, nil, err
 	}
 	if prev := store.State.Hostname; prev != "" && prev != host {
+		if !opts.forceHost {
+			store.Close()
+			return nil, nil, fmt.Errorf("state file %s was last written for host %q, not %q.\n"+
+				"Resources only in that host's config would be pruned. Use --host %s, a separate --state\n"+
+				"file, or --force-host if this machine's hostname really changed", path, prev, host, prev)
+		}
 		ui.Warn("state file %s was last written for host %q, now running as %q", path, prev, host)
 	}
 

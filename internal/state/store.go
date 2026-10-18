@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// ErrSave wraps every failure to write the state file. Callers treat it as fatal:
+// continuing to change the system without recording it would lose track of resources.
+var ErrSave = errors.New("save state")
+
 // DefaultPath is $XDG_DATA_HOME/pose/state.json, falling back to ~/.local/share.
 func DefaultPath() (string, error) {
 	dir := os.Getenv("XDG_DATA_HOME")
@@ -114,10 +118,10 @@ func (s *Store) Save() error {
 	s.State.LastApplied = time.Now().UTC().Format(time.RFC3339)
 	data, err := json.MarshalIndent(s.State, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrSave, err)
 	}
 	if err := writeAtomic(s.path, append(data, '\n')); err != nil {
-		return fmt.Errorf("write state: %w", err)
+		return fmt.Errorf("%w: %w", ErrSave, err)
 	}
 	return nil
 }

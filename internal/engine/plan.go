@@ -43,13 +43,16 @@ type Action struct {
 	Source     string // dotfile source, display form
 	TargetPath string
 	SourcePath string
-	Hash       string // current source hash
+	Hash       string // current source hash, only computed when OnChange is set
 	PrevHash   string // hash recorded in state
 	OnChange   string
-	Hook       bool // run OnChange after linking
+	Hook       bool   // run OnChange after linking
+	Backup     string // backup recorded in state, restored on prune
 
 	Active  bool // desired service state
 	Enabled bool
+
+	Adopted bool // package or service: see state.Resource.Adopted
 
 	Notes []string
 }
@@ -58,12 +61,12 @@ type Action struct {
 func (a *Action) resource() state.Resource {
 	switch a.Type {
 	case state.TypePackage:
-		return state.Resource{Type: a.Type, Manager: a.Manager, ID: a.Name}
+		return state.Resource{Type: a.Type, Manager: a.Manager, ID: a.Name, Adopted: a.Adopted}
 	case state.TypeDotfile:
-		return state.Resource{Type: a.Type, Target: a.TargetPath, Source: a.SourcePath, Hash: a.Hash, OnChange: a.OnChange}
+		return state.Resource{Type: a.Type, Target: a.TargetPath, Source: a.SourcePath, Hash: a.Hash, OnChange: a.OnChange, Backup: a.Backup}
 	default:
 		enabled := a.Enabled
-		return state.Resource{Type: a.Type, Name: a.Name, Scope: a.Scope, State: stateWord(a.Active), Enabled: &enabled}
+		return state.Resource{Type: a.Type, Name: a.Name, Scope: a.Scope, State: stateWord(a.Active), Enabled: &enabled, Adopted: a.Adopted}
 	}
 }
 
@@ -149,8 +152,8 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 
 func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 	type item struct {
-		mgr, pkg, key string
-		desired       bool
+		mgr, pkg, key    string
+		desired, adopted bool
 	}
 	var items []item
 	desired := map[string]bool{}
@@ -158,7 +161,7 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 		for _, pkg := range e.cfg.Packages[mgr] {
 			key := state.PackageKey(mgr, pkg)
 			desired[key] = true
-			items = append(items, item{mgr, pkg, key, true})
+			items = append(items, item{mgr, pkg, key, true, false})
 		}
 	}
 	for _, key := range e.store.State.Keys() {
@@ -171,7 +174,7 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 				"cannot prune package %q: package manager %q is no longer defined; keeping it in state", r.ID, r.Manager))
 			continue
 		}
-		items = append(items, item{r.Manager, r.ID, key, false})
+		items = append(items, item{r.Manager, r.ID, key, false, r.Adopted})
 	}
 
 	installed := make([]bool, len(items))
@@ -190,9 +193,13 @@ func (e *Engine) planPackages(ctx context.Context, p *Plan) error {
 		case it.desired && !installed[i]:
 			a.Kind = Install
 		case it.desired && !tracked:
-			a.Kind = Adopt
+			a.Kind, a.Adopted = Adopt, true
 		case it.desired:
 			continue
+		case installed[i] && it.adopted:
+			a.Kind = Forget
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"package %q (%s) is no longer in config but was installed before pose tracked it; leaving it installed", it.pkg, it.mgr))
 		case installed[i]:
 			a.Kind = Prune
 			a.Notes = []string{"will be uninstalled, missing from config"}
@@ -211,9 +218,14 @@ func (e *Engine) planDotfiles(_ context.Context, p *Plan) error {
 		key := state.DotfileKey(target)
 		desired[key] = true
 
-		hash, err := providers.HashPath(d.SourcePath)
-		if err != nil {
-			return err
+		// The hash only decides whether on_change must run; content edits are
+		// otherwise live already, since the target is a symlink.
+		var hash string
+		if d.OnChange != "" {
+			var err error
+			if hash, err = providers.HashPath(d.SourcePath); err != nil {
+				return err
+			}
 		}
 		st, err := providers.InspectDotfile(d.SourcePath, d.TargetPath)
 		if err != nil {
@@ -225,7 +237,7 @@ func (e *Engine) planDotfiles(_ context.Context, p *Plan) error {
 			Type: state.TypeDotfile, Key: key,
 			Target: target, Source: e.displaySource(d.SourcePath),
 			TargetPath: d.TargetPath, SourcePath: d.SourcePath,
-			Hash: hash, PrevHash: prior.Hash, OnChange: d.OnChange,
+			Hash: hash, PrevHash: prior.Hash, OnChange: d.OnChange, Backup: prior.Backup,
 		}
 		changed := true
 		switch st.Status {
@@ -241,16 +253,15 @@ func (e *Engine) planDotfiles(_ context.Context, p *Plan) error {
 			switch {
 			case !tracked:
 				a.Kind, changed = Adopt, false
-			case prior.Hash == "" && d.OnChange != "":
-				// Linked by an earlier run whose hook failed or was interrupted.
+			case d.OnChange != "" && prior.Hash == "":
+				// Linked by an earlier run whose hook failed or was interrupted,
+				// or on_change was added to an existing dotfile.
 				a.Kind = Update
-				a.Notes = append(a.Notes, "previous on_change hook did not complete")
-			case prior.Hash == "":
-				a.Kind, changed = Adopt, false
-			case prior.Hash != hash:
+				a.Notes = append(a.Notes, "on_change hook has not run for the current content")
+			case d.OnChange != "" && prior.Hash != hash:
 				a.Kind = Update
 				a.Notes = append(a.Notes, fmt.Sprintf("file modified (hash: %s -> %s)", shortHash(prior.Hash), shortHash(hash)))
-			case prior.OnChange != d.OnChange || prior.Source != d.SourcePath || prior.Target != d.TargetPath:
+			case prior.Hash != hash || prior.OnChange != d.OnChange || prior.Source != d.SourcePath || prior.Target != d.TargetPath:
 				a.Kind, changed = Adopt, false
 			default:
 				continue
@@ -275,12 +286,15 @@ func (e *Engine) planDotfiles(_ context.Context, p *Plan) error {
 		a := &Action{
 			Type: state.TypeDotfile, Key: key,
 			Target: config.ContractHome(r.Target, e.cfg.Home), Source: e.displaySource(r.Source),
-			TargetPath: r.Target, SourcePath: r.Source,
+			TargetPath: r.Target, SourcePath: r.Source, Backup: r.Backup,
 		}
 		switch st.Status {
 		case providers.LinkCorrect:
 			a.Kind = Prune
 			a.Notes = []string{"symlink will be removed, missing from config"}
+			if r.Backup != "" {
+				a.Notes = append(a.Notes, fmt.Sprintf("backup %s will be restored if still present", config.ContractHome(r.Backup, e.cfg.Home)))
+			}
 		case providers.LinkMissing:
 			a.Kind = Forget
 		default:
@@ -304,15 +318,16 @@ func (e *Engine) planServices(ctx context.Context, p *Plan) error {
 		}
 		active := s.State == config.StateActive
 		prior, tracked := e.store.State.Resources[key]
-		a := &Action{Type: state.TypeService, Key: key, Name: s.Name, Scope: s.Scope, Active: active, Enabled: s.Enabled}
+		a := &Action{Type: state.TypeService, Key: key, Name: s.Name, Scope: s.Scope, Active: active, Enabled: s.Enabled, Adopted: prior.Adopted}
+		enabledDiffers := st.Enabled != s.Enabled && !st.Static
 
 		switch {
-		case st.Active != active || st.Enabled != s.Enabled:
+		case st.Active != active || enabledDiffers:
 			a.Kind = Update
 			if st.Active != active {
 				a.Notes = append(a.Notes, fmt.Sprintf("state: %s -> %s", stateWord(st.Active), s.State))
 			}
-			if st.Enabled != s.Enabled {
+			if enabledDiffers {
 				a.Notes = append(a.Notes, fmt.Sprintf("enabled: %t -> %t", st.Enabled, s.Enabled))
 			}
 			if !st.Exists {
@@ -320,6 +335,7 @@ func (e *Engine) planServices(ctx context.Context, p *Plan) error {
 			}
 		case !tracked || prior.State != s.State || prior.Enabled == nil || *prior.Enabled != s.Enabled:
 			a.Kind = Adopt
+			a.Adopted = !tracked || prior.Adopted
 		default:
 			continue
 		}
@@ -336,7 +352,11 @@ func (e *Engine) planServices(ctx context.Context, p *Plan) error {
 			return fmt.Errorf("query service %s: %w", r.Name, err)
 		}
 		a := &Action{Type: state.TypeService, Key: key, Name: r.Name, Scope: r.Scope, Kind: Forget}
-		if st.Active || st.Enabled {
+		switch {
+		case (st.Active || st.Enabled) && r.Adopted:
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"service %s (%s) is no longer in config but was already set up before pose tracked it; leaving it as is", r.Name, r.Scope))
+		case st.Active || st.Enabled:
 			a.Kind = Prune
 			a.Notes = []string{"will be stopped and disabled, missing from config"}
 		}

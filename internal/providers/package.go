@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klahr/pose/internal/config"
@@ -44,10 +45,12 @@ func (e *CommandError) Error() string {
 func (e *CommandError) Unwrap() error { return e.Err }
 
 // exitedNonZero reports whether err is a command that ran and returned a failure
-// status, as opposed to one that could not be started or was killed.
+// status, as opposed to one that could not be started or was killed. The shell
+// reports a missing or non-executable command as 127 or 126; those count as
+// "could not be started" too.
 func exitedNonZero(err error) bool {
 	var ce *CommandError
-	return errors.As(err, &ce) && ce.ExitCode > 0
+	return errors.As(err, &ce) && ce.ExitCode > 0 && ce.ExitCode != 126 && ce.ExitCode != 127
 }
 
 type result struct {
@@ -129,6 +132,9 @@ func tail(s string, n int) string {
 type PackageManager struct {
 	Name string
 	def  config.PackageManager
+
+	mu     sync.Mutex
+	listed map[string]bool // output of the list command, nil until queried
 }
 
 func NewPackageManager(name string, def config.PackageManager) *PackageManager {
@@ -146,6 +152,13 @@ func (m *PackageManager) render(tmpl string, pkgs []string) string {
 // IsInstalled runs the check command: exit 0 means installed, any other exit
 // status means not installed. Failing to run the command at all is an error.
 func (m *PackageManager) IsInstalled(ctx context.Context, pkg string) (bool, error) {
+	if m.def.List != "" {
+		set, err := m.list(ctx)
+		if err != nil {
+			return false, fmt.Errorf("list %s packages: %w", m.Name, err)
+		}
+		return set[pkg], nil
+	}
 	_, err := runShell(ctx, false, "", m.render(m.def.Check, []string{pkg}))
 	switch {
 	case err == nil:
@@ -154,6 +167,26 @@ func (m *PackageManager) IsInstalled(ctx context.Context, pkg string) (bool, err
 		return false, nil
 	}
 	return false, fmt.Errorf("check %s package %q: %w", m.Name, pkg, err)
+}
+
+// list runs the list command once and caches the result until the next mutation.
+func (m *PackageManager) list(ctx context.Context) (map[string]bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listed != nil {
+		return m.listed, nil
+	}
+	res, err := runShell(ctx, false, "", m.def.List)
+	if err != nil {
+		return nil, err
+	}
+	m.listed = map[string]bool{}
+	for _, line := range strings.Split(res.stdout, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			m.listed[line] = true
+		}
+	}
+	return m.listed, nil
 }
 
 func (m *PackageManager) Install(ctx context.Context, pkgs []string) error {
@@ -169,6 +202,9 @@ func (m *PackageManager) mutate(ctx context.Context, tmpl string, pkgs []string)
 	if len(pkgs) == 0 {
 		return nil
 	}
+	m.mu.Lock()
+	m.listed = nil
+	m.mu.Unlock()
 	if strings.Contains(tmpl, "{packages}") {
 		_, err := runShell(ctx, true, "", m.render(tmpl, pkgs))
 		return err

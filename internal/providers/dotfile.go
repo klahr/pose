@@ -113,6 +113,23 @@ func UnlinkDotfile(source, target string) (removed bool, err error) {
 	return true, nil
 }
 
+// RestoreBackup moves backup back to target, but only if target is now free and
+// backup still exists. It reports whether the file was restored.
+func RestoreBackup(backup, target string) (bool, error) {
+	if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if _, err := os.Lstat(backup); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if err := os.Rename(backup, target); err != nil {
+		return false, fmt.Errorf("restore %s: %w", target, err)
+	}
+	return true, nil
+}
+
 // HashPath returns a SHA-256 over a file, or over a directory tree's names,
 // modes, file contents and symlink destinations. Symlinks are not followed
 // below the root.

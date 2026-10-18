@@ -100,3 +100,52 @@ func TestHashPathDirectory(t *testing.T) {
 		t.Errorf("hash did not change: %s %s %s", h1, h2, h3)
 	}
 }
+
+func TestMissingCheckCommandIsAnError(t *testing.T) {
+	pm := NewPackageManager("broken", config.PackageManager{Check: "pose-no-such-command {package}"})
+	if _, err := pm.IsInstalled(context.Background(), "a"); err == nil {
+		t.Error("exit 127 was treated as 'not installed'")
+	}
+}
+
+func TestListIsCachedUntilMutation(t *testing.T) {
+	db := t.TempDir()
+	list := filepath.Join(db, "list")
+	Output = os.Stderr
+	pm := NewPackageManager("fake", config.PackageManager{
+		List:    "cat " + list,
+		Install: "echo {package} >> " + list,
+	})
+	ctx := context.Background()
+	os.WriteFile(list, []byte("a\n"), 0o644)
+	if ok, err := pm.IsInstalled(ctx, "a"); !ok || err != nil {
+		t.Fatalf("IsInstalled(a) = %v, %v", ok, err)
+	}
+	os.WriteFile(list, []byte("a\nb\n"), 0o644)
+	if ok, _ := pm.IsInstalled(ctx, "b"); ok {
+		t.Error("list was not cached")
+	}
+	if err := pm.Install(ctx, []string{"c"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := pm.IsInstalled(ctx, "c"); !ok {
+		t.Error("cache not invalidated by install")
+	}
+}
+
+func TestRestoreBackup(t *testing.T) {
+	dir := t.TempDir()
+	backup, target := filepath.Join(dir, "b"), filepath.Join(dir, "t")
+	os.WriteFile(backup, []byte("old"), 0o644)
+	os.WriteFile(target, []byte("new"), 0o644)
+	if ok, err := RestoreBackup(backup, target); ok || err != nil {
+		t.Fatalf("restored over an existing target: %v, %v", ok, err)
+	}
+	os.Remove(target)
+	if ok, err := RestoreBackup(backup, target); !ok || err != nil {
+		t.Fatalf("restore: %v, %v", ok, err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "old" {
+		t.Errorf("target = %q", b)
+	}
+}

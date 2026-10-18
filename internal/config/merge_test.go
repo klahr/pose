@@ -2,8 +2,10 @@ package config
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -91,5 +93,44 @@ func TestExpandContractHome(t *testing.T) {
 	}
 	if got := ContractHome("/home2/x", "/h"); got != "/home2/x" {
 		t.Errorf("ContractHome = %q", got)
+	}
+}
+
+func TestNestedAndSymlinkedTargetsRejected(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(root, "files", "nvim"), 0o755)
+	os.WriteFile(filepath.Join(root, "files", "init.lua"), nil, 0o644)
+
+	os.WriteFile(filepath.Join(root, "pose.yaml"), []byte(`
+dotfiles:
+  - {source: ./files/nvim, target: ~/.config/nvim}
+  - {source: ./files/init.lua, target: ~/.config/nvim/init.lua}
+`), 0o644)
+	if _, err := Load(root, "h"); err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Errorf("nested targets: err = %v", err)
+	}
+
+	// A parent directory that is a symlink into the repository.
+	os.MkdirAll(filepath.Join(home, ".config"), 0o755)
+	os.Symlink(filepath.Join(root, "files", "nvim"), filepath.Join(home, ".config", "nvim"))
+	os.WriteFile(filepath.Join(root, "pose.yaml"), []byte(`
+dotfiles:
+  - {source: ./files/init.lua, target: ~/.config/nvim/init.lua}
+`), 0o644)
+	if _, err := Load(root, "h"); err == nil || !strings.Contains(err.Error(), "overlap the repository") {
+		t.Errorf("symlinked parent: err = %v", err)
+	}
+}
+
+func TestBuiltinTemplatesAreValidShell(t *testing.T) {
+	for name, pm := range BuiltinPackageManagers() {
+		for field, tmpl := range map[string]string{"check": pm.Check, "list": pm.List, "install": pm.Install, "remove": pm.Remove} {
+			script := strings.NewReplacer("{packages}", "a b", "{package}", "a").Replace(tmpl)
+			if out, err := exec.Command("/bin/sh", "-n", "-c", script).CombinedOutput(); err != nil {
+				t.Errorf("%s.%s: %v: %s", name, field, err, out)
+			}
+		}
 	}
 }
