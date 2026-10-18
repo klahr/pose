@@ -8,14 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klahr/pose/internal/config"
 	"github.com/klahr/pose/internal/providers"
 	"github.com/klahr/pose/internal/state"
 )
 
 // Apply executes the plan in dependency order:
 //
-//	prune services → prune packages → prune dotfiles → install packages →
-//	link dotfiles → run hooks → apply services
+//	prune services → prune packages → prune dotfiles → "before" scripts →
+//	install packages → link dotfiles → run hooks → apply services → "after" scripts
 //
 // State is flushed after every successful action, so an interrupted run resumes
 // cleanly with the next plan. Failed actions are reported at the end (and
@@ -38,8 +39,8 @@ func (e *Engine) Apply(ctx context.Context, p *Plan) error {
 
 	var errs []error
 	for _, step := range []func(context.Context, *Plan) error{
-		e.pruneServices, e.prunePackages, e.pruneDotfiles,
-		e.installPackages, e.linkDotfiles, e.runHooks, e.applyServices,
+		e.pruneServices, e.prunePackages, e.pruneDotfiles, e.runScriptsBefore,
+		e.installPackages, e.linkDotfiles, e.runHooks, e.applyServices, e.runScriptsAfter,
 	} {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
@@ -268,6 +269,37 @@ func (e *Engine) applyServices(ctx context.Context, p *Plan) error {
 		e.ui.Step(a, "updating")
 		if err := e.services.Apply(ctx, a.Name, a.Scope, a.Active, a.Enabled); err != nil {
 			errs = append(errs, fmt.Errorf("apply service %s: %w", a.Name, err))
+			continue
+		}
+		if err := e.store.Put(a.Key, a.resource()); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e *Engine) runScriptsBefore(ctx context.Context, p *Plan) error {
+	return e.runScripts(ctx, p, config.PhaseBefore)
+}
+
+func (e *Engine) runScriptsAfter(ctx context.Context, p *Plan) error {
+	return e.runScripts(ctx, p, config.PhaseAfter)
+}
+
+// runScripts runs the phase's scripts in config order, in the repository. A
+// failed script is not recorded, so it runs again next time; see Apply.
+func (e *Engine) runScripts(ctx context.Context, p *Plan, phase string) error {
+	var errs []error
+	for _, a := range p.filter(state.TypeScript, Run) {
+		if a.Phase != phase {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		e.ui.Step(a, "running")
+		if err := providers.RunHook(ctx, a.Command, e.cfg.Root); err != nil {
+			errs = append(errs, fmt.Errorf("script %s: %w", a.Name, err))
 			continue
 		}
 		if err := e.store.Put(a.Key, a.resource()); err != nil {

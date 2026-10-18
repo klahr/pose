@@ -4,9 +4,12 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,19 +26,20 @@ const (
 	Link                // + symlink
 	Update              // ~ dotfile or service
 	Prune               // - any resource
+	Run                 // > script
 	Adopt               // state only: the system already matches, start tracking it
 	Forget              // state only: the resource is already gone, stop tracking it
 )
 
 // Changes reports whether the action modifies the system.
-func (k Kind) Changes() bool { return k <= Prune }
+func (k Kind) Changes() bool { return k <= Run }
 
 type Action struct {
 	Kind Kind
-	Type string // state.TypePackage, TypeDotfile or TypeService
+	Type string // state.TypePackage, TypeDotfile, TypeService or TypeScript
 	Key  string // state key
 
-	Name    string // package or service name
+	Name    string // package, service or script name
 	Manager string // package manager
 	Scope   string // service scope
 
@@ -43,7 +47,7 @@ type Action struct {
 	Source     string // dotfile source, display form
 	TargetPath string
 	SourcePath string
-	Hash       string // current source hash, only computed when OnChange is set
+	Hash       string // current source hash, only computed when OnChange is set; script: command hash
 	PrevHash   string // hash recorded in state
 	OnChange   string
 	Hook       bool   // run OnChange after linking
@@ -53,6 +57,9 @@ type Action struct {
 	Enabled bool
 
 	Adopted bool // package or service: see state.Resource.Adopted
+
+	Command string // script
+	Phase   string
 
 	Notes []string
 }
@@ -64,6 +71,8 @@ func (a *Action) resource() state.Resource {
 		return state.Resource{Type: a.Type, Manager: a.Manager, ID: a.Name, Adopted: a.Adopted}
 	case state.TypeDotfile:
 		return state.Resource{Type: a.Type, Target: a.TargetPath, Source: a.SourcePath, Hash: a.Hash, OnChange: a.OnChange, Backup: a.Backup}
+	case state.TypeScript:
+		return state.Resource{Type: a.Type, Name: a.Name, Hash: a.Hash}
 	default:
 		enabled := a.Enabled
 		return state.Resource{Type: a.Type, Name: a.Name, Scope: a.Scope, State: stateWord(a.Active), Enabled: &enabled, Adopted: a.Adopted}
@@ -142,7 +151,7 @@ func New(cfg *config.Config, store *state.Store, ui *UI) (*Engine, error) {
 // Plan computes the actions needed to converge the system. It does not modify anything.
 func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	p := &Plan{}
-	for _, step := range []func(context.Context, *Plan) error{e.planPackages, e.planDotfiles, e.planServices} {
+	for _, step := range []func(context.Context, *Plan) error{e.planPackages, e.planDotfiles, e.planServices, e.planScripts} {
 		if err := step(ctx, p); err != nil {
 			return nil, err
 		}
@@ -414,6 +423,77 @@ func (e *Engine) planServices(ctx context.Context, p *Plan) error {
 			a.Notes = []string{"will be stopped and disabled, missing from config"}
 		}
 		p.Actions = append(p.Actions, a)
+	}
+	return nil
+}
+
+// Target keeps only the actions whose key is one of patterns or lies below one:
+// "package", "package:pacman", "dotfile:~/.config/nvim" (every file in it) or a
+// full key. A pattern naming nothing in the config or state is an error, so a
+// typo cannot pass for "no changes".
+func (e *Engine) Target(p *Plan, patterns []string) error {
+	known := e.store.State.Keys()
+	for _, mgr := range sortedKeys(e.cfg.Packages) {
+		for _, pkg := range e.cfg.Packages[mgr] {
+			known = append(known, state.PackageKey(mgr, pkg))
+		}
+	}
+	for _, d := range e.cfg.Dotfiles {
+		known = append(known, state.DotfileKey(config.ContractHome(d.TargetPath, e.cfg.Home)))
+	}
+	for _, s := range e.cfg.Services {
+		known = append(known, state.ServiceKey(s.Scope, s.Name))
+	}
+	for _, s := range e.cfg.Scripts {
+		known = append(known, state.ScriptKey(s.Name))
+	}
+	for _, pat := range patterns {
+		if !slices.ContainsFunc(known, func(k string) bool { return matchKey(k, pat) }) {
+			return fmt.Errorf("target %q matches nothing in the config or state", pat)
+		}
+	}
+
+	p.Actions = slices.DeleteFunc(p.Actions, func(a *Action) bool {
+		return !slices.ContainsFunc(patterns, func(pat string) bool { return matchKey(a.Key, pat) })
+	})
+	return nil
+}
+
+func matchKey(key, pattern string) bool {
+	rest, ok := strings.CutPrefix(key, pattern)
+	return ok && (rest == "" || rest[0] == ':' || rest[0] == '/')
+}
+
+// planScripts runs a script the first time it is seen and whenever its command
+// changes. Dropping one from the config only forgets it; there is nothing to undo.
+func (e *Engine) planScripts(_ context.Context, p *Plan) error {
+	desired := map[string]bool{}
+	for _, s := range e.cfg.Scripts {
+		key := state.ScriptKey(s.Name)
+		desired[key] = true
+		sum := sha256.Sum256([]byte(s.Run))
+		hash := hex.EncodeToString(sum[:])
+		prior, tracked := e.store.State.Resources[key]
+		if tracked && prior.Hash == hash {
+			continue
+		}
+		a := &Action{Kind: Run, Type: state.TypeScript, Key: key, Name: s.Name, Hash: hash, Command: s.Run, Phase: s.Phase}
+		if tracked {
+			a.Notes = append(a.Notes, "command changed since it last ran")
+		}
+		if s.Phase == config.PhaseBefore {
+			a.Notes = append(a.Notes, "runs before packages are installed")
+		} else {
+			a.Notes = append(a.Notes, "runs after services are applied")
+		}
+		p.Actions = append(p.Actions, a)
+	}
+
+	for _, key := range e.store.State.Keys() {
+		r := e.store.State.Resources[key]
+		if r.Type == state.TypeScript && !desired[key] {
+			p.Actions = append(p.Actions, &Action{Kind: Forget, Type: state.TypeScript, Key: key, Name: r.Name})
+		}
 	}
 	return nil
 }

@@ -150,6 +150,11 @@ func TestLoadRejects(t *testing.T) {
 	for _, tc := range []struct{ yaml, want string }{
 		{"packages:\n  pacman: [git]\n---\npackages:\n  pacman: [vim]\n", "only one YAML document"},
 		{"services:\n  - {name: foo}\n  - {name: foo.service, state: stopped}\n", "same unit as foo"},
+		{"scripts:\n  - {name: a, run: x}\n  - {name: a, run: y}\n", "duplicate script a"},
+		{"dotfiles:\n  - {source: ./pose.yaml, target: ~/.x, recursive: true}\n", "recursive requires a directory"},
+		{"scripts:\n  - {name: a}\n", "run is required"},
+		{"scripts:\n  - {name: a, run: x, phase: during}\n", "phase must be"},
+		{"scripts:\n  - {name: 'a b', run: x}\n", "invalid name"},
 	} {
 		os.WriteFile(filepath.Join(root, "pose.yaml"), []byte(tc.yaml), 0o644)
 		if _, err := Load(root, "h"); err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -199,11 +204,54 @@ esac
 
 func TestBuiltinTemplatesAreValidShell(t *testing.T) {
 	for name, pm := range BuiltinPackageManagers() {
-		for field, tmpl := range map[string]string{"check": pm.Check, "list": pm.List, "install": pm.Install, "remove": pm.Remove} {
+		for field, tmpl := range map[string]string{"check": pm.Check, "list": pm.List, "explicit": pm.Explicit, "install": pm.Install, "remove": pm.Remove} {
 			script := strings.NewReplacer("{packages}", "a b", "{package}", "a").Replace(tmpl)
 			if out, err := exec.Command("/bin/sh", "-n", "-c", script).CombinedOutput(); err != nil {
 				t.Errorf("%s.%s: %v: %s", name, field, err, out)
 			}
+		}
+	}
+}
+
+func TestIncludesMergeBeforeTheirFile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	write := func(rel, body string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("pose.yaml", "packages:\n  pacman: [git]\n")
+	write("groups/laptop.yaml", "packages:\n  pacman: [tlp]\nservices:\n  - {name: tlp, scope: system}\n")
+	write("hosts/h.yaml", "include: [groups/laptop.yaml]\nservices:\n  - {name: tlp, scope: system, state: stopped}\n")
+
+	cfg, err := Load(root, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Packages["pacman"], []string{"git", "tlp"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("packages = %v, want %v", got, want)
+	}
+	if len(cfg.Services) != 1 || cfg.Services[0].State != StateStopped {
+		t.Errorf("overlay did not win over its include: %+v", cfg.Services)
+	}
+	if want := []string{filepath.Join(root, "groups/laptop.yaml")}; !reflect.DeepEqual(cfg.Included, want) {
+		t.Errorf("included = %v", cfg.Included)
+	}
+
+	for body, want := range map[string]string{
+		"include: [groups/missing.yaml]\n":                      "file not found",
+		"include: [groups/laptop.yaml, ./groups/laptop.yaml]\n": "included more than once",
+		"include: [groups/nested.yaml]\n":                       "cannot include others",
+	} {
+		write("groups/nested.yaml", "include: [groups/laptop.yaml]\n")
+		write("hosts/h.yaml", body)
+		if _, err := Load(root, "h"); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: err = %v", body, err)
 		}
 	}
 }

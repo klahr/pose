@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -26,6 +27,7 @@ var (
 	// shell quoting, so templates stay safe even when {package} sits inside quotes.
 	packageRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9@._+:/=-]*$`)
 	serviceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9@._:-]*$`)
+	scriptRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
 // ShortHostname returns os.Hostname() without its domain, lowercased.
@@ -75,7 +77,7 @@ func ContractHome(p, home string) string {
 }
 
 // Load reads <root>/pose.yaml, merges <root>/hosts/<hostname>.yaml on top if it
-// exists, and validates the result.
+// exists, and validates the result. Each file's includes are merged just before it.
 func Load(root, hostname string) (*Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -107,22 +109,62 @@ func Load(root, hostname string) (*Config, error) {
 		Providers: Providers{PackageManagers: BuiltinPackageManagers()},
 		Packages:  map[string][]string{},
 	}
-	Merge(cfg, base)
+	if err := cfg.mergeLayer(base, filepath.Join(root, BaseFile)); err != nil {
+		return nil, err
+	}
 
 	hostPath := filepath.Join(root, HostsDir, hostname+".yaml")
 	overlay, err := parseFile(hostPath, root, home)
 	switch {
 	case err == nil:
-		Merge(cfg, overlay)
+		if err := cfg.mergeLayer(overlay, hostPath); err != nil {
+			return nil, err
+		}
 		cfg.HostFile = hostPath
 	case !errors.Is(err, fs.ErrNotExist):
 		return nil, err
 	}
 
+	if err := cfg.expand(); err != nil {
+		return nil, err
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// mergeLayer merges the files c (parsed from path) includes, then c itself.
+func (cfg *Config) mergeLayer(c *Config, path string) error {
+	for _, inc := range c.Include {
+		p, err := ExpandHome(inc, cfg.Home)
+		if err != nil {
+			return fmt.Errorf("%s: include: %w", path, err)
+		}
+		if p == "" {
+			return fmt.Errorf("%s: include: empty path", path)
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(cfg.Root, p)
+		}
+		p = filepath.Clean(p)
+		if slices.Contains(cfg.Included, p) {
+			return fmt.Errorf("%s: %s is included more than once", path, inc)
+		}
+		ic, err := parseFile(p, cfg.Root, cfg.Home)
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%s: include %s: file not found", path, inc)
+		} else if err != nil {
+			return err
+		}
+		if len(ic.Include) > 0 {
+			return fmt.Errorf("%s: included files cannot include others", p)
+		}
+		Merge(cfg, ic)
+		cfg.Included = append(cfg.Included, p)
+	}
+	Merge(cfg, c)
+	return nil
 }
 
 func parseFile(path, root, home string) (*Config, error) {
@@ -202,6 +244,62 @@ func (c *Config) resolve(root, home string) error {
 		}
 		keys[s.Key()] = true
 	}
+
+	scripts := map[string]bool{}
+	for i := range c.Scripts {
+		s := &c.Scripts[i]
+		if s.Phase == "" {
+			s.Phase = PhaseAfter
+		}
+		if scripts[s.Name] {
+			errs = append(errs, fmt.Errorf("scripts[%d]: duplicate script %s", i, s.Name))
+		}
+		scripts[s.Name] = true
+	}
+	return errors.Join(errs...)
+}
+
+// expand replaces each recursive dotfile with one entry per file or symlink
+// below its source. It runs after merging, so overlays replace whole trees.
+func (c *Config) expand() error {
+	var out []Dotfile
+	var errs []error
+	for _, d := range c.Dotfiles {
+		if !d.Recursive {
+			out = append(out, d)
+			continue
+		}
+		root, err := filepath.EvalSymlinks(d.SourcePath)
+		if err == nil {
+			var fi fs.FileInfo
+			if fi, err = os.Stat(root); err == nil && !fi.IsDir() {
+				err = errors.New("recursive requires a directory")
+			}
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("dotfile %s: source %s: %w", d.Target, d.Source, unwrapPathError(err)))
+			continue
+		}
+		err = filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
+			if err != nil || e.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return err
+			}
+			f := d
+			f.Recursive = false
+			f.Source, f.SourcePath = filepath.Join(d.Source, rel), filepath.Join(d.SourcePath, rel)
+			f.Target, f.TargetPath = filepath.Join(d.Target, rel), filepath.Join(d.TargetPath, rel)
+			out = append(out, f)
+			return nil
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("dotfile %s: %w", d.Target, err))
+		}
+	}
+	c.Dotfiles = out
 	return errors.Join(errs...)
 }
 
@@ -275,6 +373,18 @@ func (c *Config) validate() error {
 		}
 		if s.State != StateActive && s.State != StateStopped {
 			errs = append(errs, fmt.Errorf("service %s: state must be %q or %q", s.Name, StateActive, StateStopped))
+		}
+	}
+
+	for _, s := range c.Scripts {
+		if !scriptRe.MatchString(s.Name) {
+			errs = append(errs, fmt.Errorf("script %q: invalid name", s.Name))
+		}
+		if strings.TrimSpace(s.Run) == "" {
+			errs = append(errs, fmt.Errorf("script %s: run is required", s.Name))
+		}
+		if s.Phase != PhaseBefore && s.Phase != PhaseAfter {
+			errs = append(errs, fmt.Errorf("script %s: phase must be %q or %q", s.Name, PhaseBefore, PhaseAfter))
 		}
 	}
 	return errors.Join(errs...)

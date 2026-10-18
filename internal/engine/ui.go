@@ -38,7 +38,7 @@ func NewUI(out, errOut *os.File) *UI {
 // IsTerminal reports whether f is a TTY (not merely a character device like /dev/null).
 func IsTerminal(f *os.File) bool {
 	var t syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(ioctlGetTermios), uintptr(unsafe.Pointer(&t)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&t)))
 	return errno == 0
 }
 
@@ -79,6 +79,8 @@ func (u *UI) symbol(k Kind) string {
 		return u.paint(ansiYellow, "~")
 	case Prune:
 		return u.paint(ansiRed, "-")
+	case Run:
+		return u.paint(ansiGreen, ">")
 	}
 	return " "
 }
@@ -90,6 +92,8 @@ func (u *UI) describe(a *Action) string {
 		return fmt.Sprintf("package %q (%s)", a.Name, a.Manager)
 	case state.TypeDotfile:
 		return fmt.Sprintf("symlink %q -> %q", a.Target, a.Source)
+	case state.TypeScript:
+		return fmt.Sprintf("script %q", a.Name)
 	default:
 		return fmt.Sprintf("service %q (%s)", a.Name, a.Scope)
 	}
@@ -127,8 +131,9 @@ func (u *UI) RenderPlan(p *Plan) {
 		{state.TypePackage, "packages"},
 		{state.TypeDotfile, "dotfiles"},
 		{state.TypeService, "services"},
+		{state.TypeScript, "scripts"},
 	} {
-		actions := p.filter(section.typ, Install, Link, Update, Prune)
+		actions := p.filter(section.typ, Install, Link, Update, Prune, Run)
 		if len(actions) == 0 {
 			continue
 		}
@@ -146,6 +151,6 @@ func (u *UI) RenderPlan(p *Plan) {
 		}
 	}
 
-	fmt.Fprintf(u.out, "\n%s %d to install, %d to prune, %d to link, %d to update.\n",
-		u.paint(ansiBold, "Plan:"), p.Count(Install), p.Count(Prune), p.Count(Link), p.Count(Update))
+	fmt.Fprintf(u.out, "\n%s %d to install, %d to prune, %d to link, %d to update, %d to run.\n",
+		u.paint(ansiBold, "Plan:"), p.Count(Install), p.Count(Prune), p.Count(Link), p.Count(Update), p.Count(Run))
 }

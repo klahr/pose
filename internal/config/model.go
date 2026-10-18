@@ -7,20 +7,28 @@ const (
 
 	StateActive  = "active"
 	StateStopped = "stopped"
+
+	PhaseBefore = "before"
+	PhaseAfter  = "after"
 )
 
 // Config is the desired configuration for one host after merging and path resolution.
 type Config struct {
+	// Include lists files merged before the one that names them, in order.
+	// Paths are relative to the repository root; included files cannot include.
+	Include   []string            `yaml:"include"`
 	Providers Providers           `yaml:"providers"`
 	Packages  map[string][]string `yaml:"packages"`
 	Dotfiles  []Dotfile           `yaml:"dotfiles"`
 	Services  []Service           `yaml:"services"`
+	Scripts   []Script            `yaml:"scripts"`
 
 	// Filled in by Load.
-	Root     string `yaml:"-"` // absolute path of the repository
-	Home     string `yaml:"-"` // absolute path of $HOME
-	Hostname string `yaml:"-"` // short hostname used to pick the overlay
-	HostFile string `yaml:"-"` // overlay that was merged, empty if none
+	Root     string   `yaml:"-"` // absolute path of the repository
+	Home     string   `yaml:"-"` // absolute path of $HOME
+	Hostname string   `yaml:"-"` // short hostname used to pick the overlay
+	HostFile string   `yaml:"-"` // overlay that was merged, empty if none
+	Included []string `yaml:"-"` // included files, in merge order
 }
 
 type Providers struct {
@@ -31,22 +39,29 @@ type Providers struct {
 // for install and remove, {packages} (all names at once, enabling batching).
 // List, when set, prints every installed package one per line and replaces the
 // per-package check, so managers with slow queries are asked only once.
+// Explicit, optional, prints the packages installed on request (not as
+// dependencies) one per line, for `pose package unmanaged`.
 //
-// Check and list must exit 126 or 127 when the manager itself is missing (the
+// Check, list and explicit must exit 126 or 127 when the manager itself is missing (the
 // shell does this for "command not found"); any other failure of check means
 // "not installed". Guard pipelines with `command -v`, since a pipeline's
 // status is that of its last command.
 type PackageManager struct {
-	Check   string `yaml:"check"`
-	List    string `yaml:"list"`
-	Install string `yaml:"install"`
-	Remove  string `yaml:"remove"`
+	Check    string `yaml:"check"`
+	List     string `yaml:"list"`
+	Explicit string `yaml:"explicit"`
+	Install  string `yaml:"install"`
+	Remove   string `yaml:"remove"`
 }
 
 type Dotfile struct {
 	Source   string `yaml:"source"`
 	Target   string `yaml:"target"`
 	OnChange string `yaml:"on_change"`
+	// Recursive links every file below a source directory on its own, so the
+	// target stays a real directory that apps can write into. Load expands such
+	// entries into one per file.
+	Recursive bool `yaml:"recursive"`
 
 	// Absolute paths, resolved at parse time. Relative sources are resolved
 	// against the repository root, so host overlays use the same paths as pose.yaml.
@@ -62,6 +77,15 @@ type Service struct {
 	// EnabledOpt is the raw YAML value; when omitted, Enabled follows State.
 	EnabledOpt *bool `yaml:"enabled"`
 	Enabled    bool  `yaml:"-"`
+}
+
+// Script is a shell command run once, and again whenever its text changes.
+// Phase before runs it ahead of package installs (e.g. to bootstrap a package
+// manager), after once services are applied.
+type Script struct {
+	Name  string `yaml:"name"`
+	Run   string `yaml:"run"`
+	Phase string `yaml:"phase"` // defaults to "after"
 }
 
 // Key identifies a service across base and overlay files.
@@ -87,27 +111,25 @@ func BuiltinPackageManagers() map[string]PackageManager {
 				`!s && $1 == "Provides" && $3 != "None" { for (k = 3; k <= NF; k++) { sub(/=.*/, "", $k); i[$k] = 1; print $k } } ` +
 				`s && NF == 2 { g[$1] = 1; if (!($2 in i)) m[$1] = 1 } ` +
 				`END { for (x in g) if (!(x in m)) print x }'`,
-			Install: "sudo pacman -S --needed --noconfirm {packages}",
-			Remove:  "sudo pacman -Rns --noconfirm {packages}",
+			// Native packages not required or optionally required by others.
+			Explicit: "command -v pacman >/dev/null 2>&1 || exit 127; pacman -Qqentt",
+			Install:  "sudo pacman -S --needed --noconfirm {packages}",
+			Remove:   "sudo pacman -Rns --noconfirm {packages}",
 		},
 		"apt": {
 			// dpkg -s also succeeds for removed packages whose config files remain.
-			Check:   `command -v dpkg-query >/dev/null 2>&1 || exit 127; dpkg-query -W -f='${db:Status-Status}' {package} 2>/dev/null | grep -qx installed`,
-			Install: "sudo apt-get install -y {packages}",
-			Remove:  "sudo apt-get purge -y {packages}",
+			Check:    `command -v dpkg-query >/dev/null 2>&1 || exit 127; dpkg-query -W -f='${db:Status-Status}' {package} 2>/dev/null | grep -qx installed`,
+			Explicit: "command -v apt-mark >/dev/null 2>&1 || exit 127; apt-mark showmanual",
+			Install:  "sudo apt-get install -y {packages}",
+			Remove:   "sudo apt-get purge -y {packages}",
 		},
 		"brew": {
 			// Both short and tap-qualified names, so either form matches.
-			Check:   "brew list --formula {package} >/dev/null 2>&1",
-			List:    "brew list --formula -1 && brew list --formula -1 --full-name",
-			Install: "brew install --formula {packages}",
-			Remove:  "brew uninstall --formula {packages}",
-		},
-		"brew-cask": {
-			Check:   "brew list --cask {package} >/dev/null 2>&1",
-			List:    "brew list --cask -1 && brew list --cask -1 --full-name",
-			Install: "brew install --cask {packages}",
-			Remove:  "brew uninstall --cask {packages}",
+			Check:    "brew list --formula {package} >/dev/null 2>&1",
+			List:     "brew list --formula -1 && brew list --formula -1 --full-name",
+			Explicit: "brew leaves --installed-on-request",
+			Install:  "brew install --formula {packages}",
+			Remove:   "brew uninstall --formula {packages}",
 		},
 		"cargo": {
 			// Crate lines look like "name v1.2.3:" or "name v1.2.3 (source):"; both the
@@ -116,8 +138,9 @@ func BuiltinPackageManagers() map[string]PackageManager {
 				`'/^[^ ]/ { v = $2; sub(/^v/, "", v); sub(/:$/, "", v); if ($1 == p || $1 "@" v == p) f = 1 } END { exit !f }'`,
 			List: `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk ` +
 				`'/^[^ ]/ { v = $2; sub(/^v/, "", v); sub(/:$/, "", v); print $1; print $1 "@" v }'`,
-			Install: "cargo install {package}",
-			Remove:  "cargo uninstall {package}",
+			Explicit: `command -v cargo >/dev/null 2>&1 || exit 127; cargo install --list | awk '/^[^ ]/ { print $1 }'`,
+			Install:  "cargo install {package}",
+			Remove:   "cargo uninstall {package}",
 		},
 	}
 }

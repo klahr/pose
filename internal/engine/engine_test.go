@@ -57,7 +57,8 @@ type harness struct {
 	t                     *testing.T
 	home, root, db, state string
 	svc                   *fakeServices
-	remove                string // remove template for the fake package manager
+	remove                string   // remove template for the fake package manager
+	targets               []string // passed to Engine.Target when set
 }
 
 func newHarness(t *testing.T) *harness {
@@ -127,6 +128,11 @@ func (h *harness) run(apply bool) (*Plan, error) {
 	p, err := e.Plan(context.Background())
 	if err != nil {
 		h.t.Fatal(err)
+	}
+	if h.targets != nil {
+		if err := e.Target(p, h.targets); err != nil {
+			return nil, err
+		}
 	}
 	if !apply {
 		return p, nil
@@ -493,5 +499,109 @@ func TestServicePruneFailureIsReportedAndRetried(t *testing.T) {
 	}
 	if _, ok := h.stateResource("service:user:foo"); !ok {
 		t.Error("failed prune dropped the service from state")
+	}
+}
+
+func TestScriptsRunInPhaseOrderAndOnlyWhenChanged(t *testing.T) {
+	h := newHarness(t)
+	h.write("files/a", "a")
+	h.config(`dotfiles:
+  - {source: ./files/a, target: ~/.a, on_change: echo hook >> log}
+scripts:
+  - {name: late, run: echo after >> log}
+  - {name: early, run: echo before >> log, phase: before}
+`)
+	p := h.mustApply()
+	if k := kinds(p); k["script:early"] != Run || k["script:late"] != Run {
+		t.Fatalf("first plan = %v", k)
+	}
+	if b, _ := os.ReadFile(filepath.Join(h.root, "log")); string(b) != "before\nhook\nafter\n" {
+		t.Errorf("log = %q", b)
+	}
+	if p, _ := h.run(false); p.HasChanges() {
+		t.Errorf("unchanged scripts planned again: %v", kinds(p))
+	}
+
+	h.config(`scripts:
+  - {name: late, run: echo after2 >> log}
+`)
+	p = h.mustApply()
+	if k := kinds(p); k["script:late"] != Run || k["script:early"] != Forget {
+		t.Fatalf("second plan = %v", k)
+	}
+	if b, _ := os.ReadFile(filepath.Join(h.root, "log")); !strings.HasSuffix(string(b), "after\nafter2\n") {
+		t.Errorf("log = %q", b)
+	}
+}
+
+func TestFailedScriptIsRetried(t *testing.T) {
+	h := newHarness(t)
+	h.config("scripts:\n  - {name: s, run: test -f ok}\n")
+	if _, err := h.run(true); err == nil || !strings.Contains(err.Error(), "script s") {
+		t.Fatalf("apply error = %v", err)
+	}
+	if _, ok := h.stateResource("script:s"); ok {
+		t.Error("failed script was recorded")
+	}
+	h.write("ok", "")
+	if p := h.mustApply(); kinds(p)["script:s"] != Run {
+		t.Errorf("failed script not retried: %v", kinds(p))
+	}
+}
+
+func TestRecursiveDotfileLinksEachFile(t *testing.T) {
+	h := newHarness(t)
+	h.write("files/nvim/init.lua", "1")
+	h.write("files/nvim/lua/opts.lua", "2")
+	h.config("dotfiles:\n  - {source: ./files/nvim, target: ~/.config/nvim, recursive: true}\n")
+	p := h.mustApply()
+	if k := kinds(p); len(k) != 2 || k["dotfile:~/.config/nvim/init.lua"] != Link || k["dotfile:~/.config/nvim/lua/opts.lua"] != Link {
+		t.Fatalf("plan = %v", k)
+	}
+	if fi, err := os.Lstat(filepath.Join(h.home, ".config/nvim")); err != nil || !fi.IsDir() {
+		t.Fatalf("target is not a real directory: %v", err)
+	}
+	if dest, _ := os.Readlink(filepath.Join(h.home, ".config/nvim/lua/opts.lua")); dest != filepath.Join(h.root, "files/nvim/lua/opts.lua") {
+		t.Errorf("link = %q", dest)
+	}
+
+	if err := os.Remove(filepath.Join(h.root, "files/nvim/init.lua")); err != nil {
+		t.Fatal(err)
+	}
+	p = h.mustApply()
+	if k := kinds(p); len(k) != 1 || k["dotfile:~/.config/nvim/init.lua"] != Prune {
+		t.Fatalf("plan after removing a file = %v", k)
+	}
+	if _, err := os.Lstat(filepath.Join(h.home, ".config/nvim/init.lua")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("link for removed file still there: %v", err)
+	}
+}
+
+func TestTargetRestrictsPlan(t *testing.T) {
+	h := newHarness(t)
+	h.write("files/nvim/init.lua", "")
+	h.write("files/a", "")
+	h.config(`packages:
+  fake: [git]
+dotfiles:
+  - {source: ./files/nvim, target: ~/.config/nvim, recursive: true}
+  - {source: ./files/a, target: ~/.config/nvim2}
+`)
+	h.targets = []string{"dotfile:~/.config/nvim"}
+	p := h.mustApply()
+	if k := kinds(p); len(k) != 1 || k["dotfile:~/.config/nvim/init.lua"] != Link {
+		t.Fatalf("targeted plan = %v", k)
+	}
+	if h.installed("git") {
+		t.Error("untargeted package was installed")
+	}
+
+	h.targets = []string{"package:fak"}
+	if _, err := h.run(false); err == nil || !strings.Contains(err.Error(), "matches nothing") {
+		t.Errorf("partial-word target: err = %v", err)
+	}
+	h.targets = []string{"package"}
+	if p, err := h.run(false); err != nil || len(p.Actions) != 1 || p.Actions[0].Key != "package:fake:git" {
+		t.Errorf("type target: %v, %+v", err, p)
 	}
 }

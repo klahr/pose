@@ -5,6 +5,7 @@ package config
 //   - packages.<manager>: concatenated and deduplicated, order preserved
 //   - dotfiles: deduplicated by expanded target, src wins
 //   - services: deduplicated by <scope>:<name>, src wins
+//   - scripts: deduplicated by name, src wins
 //
 // Both configs must already be resolved (see resolve) so targets are comparable.
 func Merge(dst, src *Config) {
@@ -18,6 +19,9 @@ func Merge(dst, src *Config) {
 		}
 		if pm.List != "" {
 			cur.List = pm.List
+		}
+		if pm.Explicit != "" {
+			cur.Explicit = pm.Explicit
 		}
 		if pm.Install != "" {
 			cur.Install = pm.Install
@@ -48,6 +52,14 @@ func Merge(dst, src *Config) {
 			dst.Services[i] = s
 		} else {
 			dst.Services = append(dst.Services, s)
+		}
+	}
+
+	for _, s := range src.Scripts {
+		if i := indexOf(dst.Scripts, func(x Script) bool { return x.Name == s.Name }); i >= 0 {
+			dst.Scripts[i] = s
+		} else {
+			dst.Scripts = append(dst.Scripts, s)
 		}
 	}
 }

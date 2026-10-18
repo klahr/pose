@@ -196,6 +196,23 @@ func (m *PackageManager) list(ctx context.Context) (map[string]bool, error) {
 	return m.listed, nil
 }
 
+// Explicit runs the explicit command; ok is false when the manager defines none.
+func (m *PackageManager) Explicit(ctx context.Context) (pkgs []string, ok bool, err error) {
+	if m.def.Explicit == "" {
+		return nil, false, nil
+	}
+	res, err := runShell(ctx, false, "", m.def.Explicit)
+	if err != nil {
+		return nil, true, err
+	}
+	for _, line := range strings.Split(res.stdout, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			pkgs = append(pkgs, line)
+		}
+	}
+	return pkgs, true, nil
+}
+
 func (m *PackageManager) Install(ctx context.Context, pkgs []string) error {
 	return m.mutate(ctx, m.def.Install, pkgs)
 }

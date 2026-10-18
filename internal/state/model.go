@@ -9,6 +9,7 @@ const (
 	TypePackage = "package"
 	TypeDotfile = "dotfile"
 	TypeService = "service"
+	TypeScript  = "script"
 )
 
 type State struct {
@@ -43,6 +44,8 @@ type Resource struct {
 	Scope   string `json:"scope,omitempty"`
 	State   string `json:"state,omitempty"`
 	Enabled *bool  `json:"enabled,omitempty"`
+
+	// script: Name, and Hash of the command that last succeeded
 }
 
 func New() *State {
@@ -55,6 +58,8 @@ func PackageKey(manager, id string) string { return TypePackage + ":" + manager 
 func DotfileKey(target string) string { return TypeDotfile + ":" + target }
 
 func ServiceKey(scope, name string) string { return TypeService + ":" + scope + ":" + name }
+
+func ScriptKey(name string) string { return TypeScript + ":" + name }
 
 // Keys returns all resource keys in sorted order.
 func (s *State) Keys() []string {
